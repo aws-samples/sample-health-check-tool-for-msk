@@ -81,12 +81,12 @@ def main() -> int:
         # Validate inputs
         logger.info("Validating inputs...")
         region_result = validate_region(args.region)
-        if not region_result.is_valid:
+        if not region_result.is_valid:  # nosemgrep: is-function-without-parentheses
             logger.error(region_result.error_message)
             return 1
         
         arn_result = validate_arn(args.cluster_arn)
-        if not arn_result.is_valid:
+        if not arn_result.is_valid:  # nosemgrep: is-function-without-parentheses
             logger.error(arn_result.error_message)
             return 1
         
@@ -97,7 +97,7 @@ def main() -> int:
         # Verify cluster exists
         logger.info("Verifying cluster exists...")
         exists_result = verify_cluster_exists(clients.msk_client, args.cluster_arn)
-        if not exists_result.is_valid:
+        if not exists_result.is_valid:  # nosemgrep: is-function-without-parentheses
             logger.error(exists_result.error_message)
             return 1
         

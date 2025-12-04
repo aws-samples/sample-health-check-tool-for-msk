@@ -1262,8 +1262,16 @@ def get_recommended_kafka_version() -> str:
         import urllib.request
         import re
         
+        # Static AWS documentation URL - hardcoded to prevent file:// or custom schemes
         url = "https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html"
-        with urllib.request.urlopen(url, timeout=5) as response:
+        
+        # Validate URL scheme to prevent file:// access
+        if not url.startswith("https://"):
+            logger.warning("Invalid URL scheme, using fallback version: 3.8")
+            return "3.8"
+        
+        request = urllib.request.Request(url, headers={'User-Agent': 'MSK-Health-Check/1.0'})
+        with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310
             html = response.read().decode('utf-8')
             
         # Look for pattern: "version 3.8.x (Recommended)" or "Amazon MSK version 3.8.x (Recommended)"
