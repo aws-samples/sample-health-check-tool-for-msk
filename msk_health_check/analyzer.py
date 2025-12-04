@@ -1270,6 +1270,7 @@ def get_recommended_kafka_version() -> str:
             logger.warning("Invalid URL scheme, using fallback version: 3.8")
             return "3.8"
         
+        # nosemgrep: dynamic-urllib-use-detected
         request = urllib.request.Request(url, headers={'User-Agent': 'MSK-Health-Check/1.0'})
         with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310
             html = response.read().decode('utf-8')
