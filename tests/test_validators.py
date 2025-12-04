@@ -13,7 +13,7 @@ class TestValidateRegion:
         valid_regions = ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-south-1']
         for region in valid_regions:
             result = validate_region(region)
-            assert result.is_valid
+            assert result.is_valid  # nosemgrep: is-function-without-parentheses
             assert result.error_message is None
     
     def test_invalid_regions(self):
@@ -29,7 +29,7 @@ class TestValidateRegion:
         ]
         for region in invalid_regions:
             result = validate_region(region)
-            assert not result.is_valid
+            assert not result.is_valid  # nosemgrep: is-function-without-parentheses
             assert result.error_message is not None
 
 
@@ -40,7 +40,7 @@ class TestValidateArn:
         """Test valid MSK cluster ARN."""
         arn = 'arn:aws:kafka:us-east-1:123456789012:cluster/my-cluster/abc-123-def'
         result = validate_arn(arn)
-        assert result.is_valid
+        assert result.is_valid  # nosemgrep: is-function-without-parentheses
         assert result.error_message is None
     
     def test_invalid_arns(self):
@@ -55,7 +55,7 @@ class TestValidateArn:
         ]
         for arn in invalid_arns:
             result = validate_arn(arn)
-            assert not result.is_valid
+            assert not result.is_valid  # nosemgrep: is-function-without-parentheses
             assert result.error_message is not None
 
 
@@ -67,7 +67,7 @@ class TestVerifyClusterExists:
         mock_client = MockMSKClient(exists=True)
         arn = 'arn:aws:kafka:us-east-1:123456789012:cluster/test/uuid'
         result = verify_cluster_exists(mock_client, arn)
-        assert result.is_valid
+        assert result.is_valid  # nosemgrep: is-function-without-parentheses
         assert result.error_message is None
     
     def test_cluster_not_found(self):
@@ -75,7 +75,7 @@ class TestVerifyClusterExists:
         mock_client = MockMSKClient(exists=False)
         arn = 'arn:aws:kafka:us-east-1:123456789012:cluster/test/uuid'
         result = verify_cluster_exists(mock_client, arn)
-        assert not result.is_valid
+        assert not result.is_valid  # nosemgrep: is-function-without-parentheses
         assert 'not found' in result.error_message.lower()
     
     def test_other_client_error(self):
@@ -83,7 +83,7 @@ class TestVerifyClusterExists:
         mock_client = MockMSKClient(error='AccessDenied')
         arn = 'arn:aws:kafka:us-east-1:123456789012:cluster/test/uuid'
         result = verify_cluster_exists(mock_client, arn)
-        assert not result.is_valid
+        assert not result.is_valid  # nosemgrep: is-function-without-parentheses
         assert result.error_message is not None
 
 
