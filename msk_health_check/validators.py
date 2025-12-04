@@ -43,7 +43,8 @@ def validate_arn(arn: str) -> ValidationResult:
     Returns:
         ValidationResult indicating if ARN is valid
     """
-    pattern = r'^arn:aws:kafka:[a-z]{2}-[a-z]+-\d{1}:\d{12}:cluster/[a-zA-Z0-9_-]+/[a-f0-9-]+$'
+    # Support both Standard and Express (with -s suffix) cluster ARNs
+    pattern = r'^arn:aws:kafka:[a-z]{2}-[a-z]+-\d{1}:\d{12}:cluster/[a-zA-Z0-9_-]+/[a-f0-9-]+(-s\d+)?$'
     if re.match(pattern, arn):
         return ValidationResult(is_valid=True)
     return ValidationResult(
