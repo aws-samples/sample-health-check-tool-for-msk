@@ -51,9 +51,9 @@ def create_aws_clients(region: str) -> AWSClients:
             region=region
         )
     except NoCredentialsError as e:
-        logger.error("AWS credentials not found. Please configure credentials using "
+        logger.warning("AWS credentials not found. Please configure credentials using "
                     "AWS CLI, environment variables, or IAM role.")
         raise
     except ClientError as e:
-        logger.error(f"Failed to create AWS clients: {e}")
+        logger.warning(f"Failed to create AWS clients: {e}")
         raise
