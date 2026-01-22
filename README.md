@@ -9,7 +9,7 @@ An automated health analysis and reporting tool for Amazon MSK clusters that gen
 This sample Python CLI tool demonstrates how to automate operational reviews of Amazon MSK clusters. It shows how to:
 - Collect up to 30 days of CloudWatch metrics programmatically
 - Analyze metrics against AWS MSK best practices
-- Generate professional PDF reports with visualizations
+- Generate  PDF reports with visualizations
 - Provide prioritized, actionable recommendations
 
 The tool is designed to be a starting point for building your own MSK monitoring and reporting solutions. You can use it as-is for basic health checks or extend it with additional metrics, custom thresholds, and organization-specific best practices.
