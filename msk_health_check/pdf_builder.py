@@ -82,6 +82,10 @@ def build_pdf_report(content: ReportContent, output_path: str) -> None:
     story.append(Paragraph(f'Generated: {content.generation_time.strftime("%B %d, %Y")}', subtitle_style))
     story.append(PageBreak())
     
+    # Disclaimer
+    story.extend(create_disclaimer_section(styles))
+    story.append(PageBreak())
+    
     # Table of Contents
     story.extend(create_table_of_contents(styles))
     story.append(PageBreak())
@@ -691,6 +695,38 @@ def create_important_links_section(styles) -> List:
     
     for title, url in links:
         elements.append(Paragraph(f'• <a href="{url}" color="blue">{title}</a>', styles['Normal']))
+    
+    return elements
+
+
+def create_disclaimer_section(styles) -> List:
+    """Create disclaimer section."""
+    elements = []
+    
+    elements.append(Paragraph('<b>Important Notice</b>', styles['Heading1']))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    disclaimer_text = """
+    This health check report provides automated analysis based on general AWS best practices 
+    and standard metric thresholds. The findings and recommendations are synthetic in nature 
+    and should be interpreted within the context of your specific environment.
+    """
+    elements.append(Paragraph(disclaimer_text, styles['Normal']))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    elements.append(Paragraph('<b>Key Considerations:</b>', styles['Heading2']))
+    elements.append(Spacer(1, 0.1*inch))
+    
+    considerations = [
+        ('<b>Context Matters</b>: Metric patterns that appear concerning in isolation may be normal '
+         'for your workload characteristics, application behavior, and usage patterns.'),
+        ('<b>Holistic Analysis Required</b>: Effective troubleshooting and optimization require '
+         'correlating multiple metrics, understanding application architecture, and considering business requirements.')
+    ]
+    
+    for consideration in considerations:
+        elements.append(Paragraph(f'• {consideration}', styles['Normal']))
+        elements.append(Spacer(1, 0.1*inch))
     
     return elements
 
