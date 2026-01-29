@@ -154,10 +154,8 @@ High heap memory after garbage collection indicates memory pressure and can caus
 - **Healthy** (HEALTHY): Heap after GC <60%
 
 **Recommendations:**
-- Tune JVM heap settings
 - Scale up to instance type with more memory
 - Reduce transactional.id.expiration.ms (if using transactions)
-- Review memory-intensive configurations
 
 ---
 

@@ -64,7 +64,7 @@ RECOMMENDATION_TEMPLATES = {
         'estimated_impact': 'Improve broker stability and performance'
     },
     'HeapMemoryAfterGC': {
-        'action': 'Tune JVM heap settings or scale up instance type',
+        'action': 'Scale up to instance type with more memory',
         'rationale': 'High heap memory after GC indicates memory pressure',
         'impact': 'Frequent garbage collection pauses affecting performance',
         'docs': ['https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html'],
