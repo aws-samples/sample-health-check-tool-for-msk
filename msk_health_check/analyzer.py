@@ -142,6 +142,7 @@ def analyze_metrics(
     findings.extend(analyze_availability_zones(cluster_info))
     findings.extend(analyze_storage_auto_scaling(cluster_info))
     findings.extend(analyze_logging_configuration(cluster_info))
+    findings.extend(analyze_enhanced_monitoring(cluster_info))
     # findings.extend(analyze_intelligent_rebalancing(cluster_info))  # Disabled: API doesn't return Rebalancing field
     
     # Calculate overall health score
@@ -1635,6 +1636,48 @@ def analyze_logging_configuration(cluster_info: ClusterInfo) -> List[Finding]:
             current_value=1.0,
             threshold_value=1.0,
             evidence={'enabled': True, 'destinations': cluster_info.logging_destinations}
+        ))
+    
+    return findings
+
+
+def analyze_enhanced_monitoring(cluster_info: ClusterInfo) -> List[Finding]:
+    """Check if enhanced monitoring is enabled."""
+    findings = []
+    
+    if cluster_info.enhanced_monitoring_level != 'PER_BROKER':
+        findings.append(Finding(
+            metric_name='EnhancedMonitoring',
+            severity=Severity.INFORMATIONAL,
+            category=Category.PERFORMANCE,
+            title='Enhanced Monitoring Not Enabled',
+            description=(
+                f"Enhanced monitoring is set to '{cluster_info.enhanced_monitoring_level}'. "
+                f"Consider enabling 'PER_BROKER' monitoring for better observability. "
+                f"\n\nBenefits of PER_BROKER monitoring:\n"
+                f"• Detect broker-level imbalances (CPU, memory, disk, network per broker)\n"
+                f"• Identify hot brokers and partition distribution issues\n"
+                f"• Faster troubleshooting with granular metrics\n"
+                f"• Better capacity planning and right-sizing decisions\n"
+                f"• No impact on cluster performance\n\n"
+                f"With DEFAULT monitoring, you only see cluster-wide aggregated metrics, which can hide "
+                f"individual broker issues. PER_BROKER provides the visibility needed to detect and resolve "
+                f"imbalances before they impact performance."
+            ),
+            current_value=0.0,
+            threshold_value=1.0,
+            evidence={'current_level': cluster_info.enhanced_monitoring_level, 'recommended_level': 'PER_BROKER'}
+        ))
+    else:
+        findings.append(Finding(
+            metric_name='EnhancedMonitoring',
+            severity=Severity.HEALTHY,
+            category=Category.PERFORMANCE,
+            title='Enhanced Monitoring Enabled',
+            description=f"Enhanced monitoring is set to 'PER_BROKER', providing granular per-broker metrics for better observability.",
+            current_value=1.0,
+            threshold_value=1.0,
+            evidence={'current_level': cluster_info.enhanced_monitoring_level}
         ))
     
     return findings

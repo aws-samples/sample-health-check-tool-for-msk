@@ -106,6 +106,13 @@ RECOMMENDATION_TEMPLATES = {
         'docs': ['https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html#partitions-per-broker'],
         'estimated_impact': 'Improve throughput, reduce latency, and prevent broker overload'
     },
+    'EnhancedMonitoring': {
+        'action': 'Enable PER_BROKER enhanced monitoring',
+        'rationale': 'Provides per-broker visibility for detecting imbalances and troubleshooting issues',
+        'impact': 'Better observability and faster issue detection',
+        'docs': ['https://docs.aws.amazon.com/msk/latest/developerguide/monitoring.html'],
+        'estimated_impact': 'Improved visibility into broker-level metrics for proactive issue detection'
+    },
     'Authentication': {
         'action': 'Enable IAM, SASL/SCRAM, or mTLS authentication and disable unauthenticated access',
         'rationale': 'Unauthenticated access is a critical security risk',
