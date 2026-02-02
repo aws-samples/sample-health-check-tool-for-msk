@@ -115,7 +115,7 @@ def analyze_metrics(
     for metric_name in ['CpuUser', 'CpuSystem', 'MemoryUsed', 'MemoryFree', 'HeapMemoryAfterGC',
                         'KafkaDataLogsDiskUsed', 'LeaderCount', 'PartitionCount', 
                         'UnderMinIsrPartitionCount', 'BytesInPerSec', 'BytesOutPerSec', 'MessagesInPerSec',
-                        'ConnectionCount']:
+                        'ConnectionCount', 'ConnectionCreationRate']:
         if metric_name in metrics.metrics:
             broker_metrics_list = get_broker_metrics(metrics.metrics[metric_name])
             if broker_metrics_list:
@@ -977,6 +977,145 @@ def analyze_connection_count(
     return findings
 
 
+def analyze_connection_creation_rate(
+    broker_metrics: List[MetricData],
+    cluster_info: ClusterInfo
+) -> List[Finding]:
+    """
+    Analyze connection creation rate to detect excessive reconnections.
+    
+    High connection creation rates indicate:
+    - Missing connection pooling
+    - Short connection timeouts
+    - Network instability
+    - Client restart loops
+    
+    Reference: AWS MSK Best Practices
+    - IAM auth supports up to 100 new connections/sec per cluster
+    - New connections are expensive (CPU overhead)
+    - Sustained high rates indicate client configuration issues
+    """
+    findings = []
+    
+    if not broker_metrics:
+        return findings
+    
+    # Calculate cluster-wide statistics
+    all_avgs = [m.statistics['avg'] for m in broker_metrics]
+    all_p95s = [m.statistics['p95'] for m in broker_metrics]
+    all_maxs = [m.statistics['max'] for m in broker_metrics]
+    
+    cluster_avg = sum(all_avgs)  # Sum across brokers for cluster-wide rate
+    cluster_p95 = sum(all_p95s)
+    cluster_max = sum(all_maxs)
+    
+    # Thresholds based on AWS documentation and best practices
+    # IAM auth limit: 100 connections/sec per cluster
+    # General recommendation: Keep creation rate low for stable workloads
+    
+    # Check if IAM authentication is enabled (more restrictive limits)
+    is_iam_auth = 'IAM' in cluster_info.authentication_methods
+    
+    if is_iam_auth:
+        critical_threshold = 80.0  # 80% of IAM limit (100/sec)
+        warning_threshold = 50.0   # 50% of IAM limit
+    else:
+        critical_threshold = 50.0  # Arbitrary threshold for non-IAM
+        warning_threshold = 20.0
+    
+    # Analyze P95 (sustained high rate is more concerning than spikes)
+    if cluster_p95 >= critical_threshold:
+        auth_note = ' (approaching IAM auth limit of 100/sec)' if is_iam_auth else ''
+        findings.append(Finding(
+            metric_name='ConnectionCreationRate',
+            severity=Severity.CRITICAL,
+            category=Category.PERFORMANCE,
+            title='Excessive Connection Creation Rate',
+            description=(
+                f'High connection creation rate detected: P95={cluster_p95:.1f} conn/sec, '
+                f'avg={cluster_avg:.1f} conn/sec, max={cluster_max:.1f} conn/sec{auth_note}. '
+                f'This indicates missing connection pooling, short timeouts, or client instability. '
+                f'New connections are expensive and impact CPU performance.'
+            ),
+            current_value=cluster_p95,
+            threshold_value=critical_threshold,
+            evidence={
+                'cluster_avg': cluster_avg,
+                'cluster_p95': cluster_p95,
+                'cluster_max': cluster_max,
+                'broker_count': len(broker_metrics),
+                'iam_auth_enabled': is_iam_auth
+            }
+        ))
+    elif cluster_p95 >= warning_threshold:
+        auth_note = ' (IAM auth limit is 100/sec)' if is_iam_auth else ''
+        findings.append(Finding(
+            metric_name='ConnectionCreationRate',
+            severity=Severity.WARNING,
+            category=Category.PERFORMANCE,
+            title='Elevated Connection Creation Rate',
+            description=(
+                f'Elevated connection creation rate: P95={cluster_p95:.1f} conn/sec, '
+                f'avg={cluster_avg:.1f} conn/sec, max={cluster_max:.1f} conn/sec{auth_note}. '
+                f'Consider implementing connection pooling and reviewing client timeout configurations.'
+            ),
+            current_value=cluster_p95,
+            threshold_value=warning_threshold,
+            evidence={
+                'cluster_avg': cluster_avg,
+                'cluster_p95': cluster_p95,
+                'cluster_max': cluster_max,
+                'broker_count': len(broker_metrics),
+                'iam_auth_enabled': is_iam_auth
+            }
+        ))
+    elif cluster_avg >= 5.0:
+        # Informational: Moderate rate, worth monitoring
+        findings.append(Finding(
+            metric_name='ConnectionCreationRate',
+            severity=Severity.INFORMATIONAL,
+            category=Category.PERFORMANCE,
+            title='Moderate Connection Creation Rate',
+            description=(
+                f'Connection creation rate: P95={cluster_p95:.1f} conn/sec, '
+                f'avg={cluster_avg:.1f} conn/sec, max={cluster_max:.1f} conn/sec. '
+                f'Rate is within acceptable range. Monitor for increases that may indicate client issues.'
+            ),
+            current_value=cluster_avg,
+            threshold_value=None,
+            evidence={
+                'cluster_avg': cluster_avg,
+                'cluster_p95': cluster_p95,
+                'cluster_max': cluster_max,
+                'broker_count': len(broker_metrics),
+                'iam_auth_enabled': is_iam_auth
+            }
+        ))
+    else:
+        # Healthy: Low connection creation rate
+        findings.append(Finding(
+            metric_name='ConnectionCreationRate',
+            severity=Severity.HEALTHY,
+            category=Category.PERFORMANCE,
+            title='Low Connection Creation Rate',
+            description=(
+                f'Connection creation rate is low: P95={cluster_p95:.1f} conn/sec, '
+                f'avg={cluster_avg:.1f} conn/sec. This indicates stable client connections.'
+            ),
+            current_value=cluster_avg,
+            threshold_value=None,
+            evidence={
+                'cluster_avg': cluster_avg,
+                'cluster_p95': cluster_p95,
+                'cluster_max': cluster_max,
+                'broker_count': len(broker_metrics),
+                'iam_auth_enabled': is_iam_auth
+            }
+        ))
+    
+    return findings
+
+
 def analyze_connection_churn(
     creation_rate: MetricData,
     close_rate: MetricData
@@ -1587,6 +1726,10 @@ def analyze_per_broker_metrics(broker_metrics: List[MetricData], metric_name: st
     # Skip storage metrics for EXPRESS clusters (serverless storage)
     if cluster_info.cluster_type == 'EXPRESS' and metric_name == 'KafkaDataLogsDiskUsed':
         return findings
+    
+    # Special handling for ConnectionCreationRate - use dedicated analysis
+    if metric_name == 'ConnectionCreationRate':
+        return analyze_connection_creation_rate(broker_metrics, cluster_info)
     
     # For LeaderCount and PartitionCount, use current values (last collected)
     # For other metrics, use averages

@@ -599,6 +599,8 @@ def _get_metric_description(metric_name: str) -> str:
         'LeaderCount': 'Number of partition leaders on each broker. Should be balanced across brokers for optimal performance.',
         'PartitionCount': 'Total number of partitions per broker including replicas. High counts can impact performance.',
         'ClientConnectionCount': 'Number of active client connections to the cluster. Monitor against instance connection limits.',
+        'ConnectionCount': 'Total number of connections to the broker (including inter-broker connections). Monitor for connection exhaustion.',
+        'ConnectionCreationRate': 'Rate of new connections being created per second. High rates indicate missing connection pooling, short timeouts, or client instability. IAM auth is limited to 100 connections/sec.',
         'UnderMinIsrPartitionCount': 'Number of partitions with in-sync replicas below the minimum. Indicates replication lag and potential data loss risk.',
         'BytesInPerSec': 'Rate of data being written to the cluster in bytes per second. Indicates producer throughput.',
         'BytesOutPerSec': 'Rate of data being read from the cluster in bytes per second. Indicates consumer throughput.',

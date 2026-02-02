@@ -15,11 +15,12 @@ class TestMetricDefinitions:
     
     def test_all_14_metrics_defined(self):
         """Test that required metrics are defined."""
-        assert len(STANDARD_METRICS) >= 13
+        assert len(STANDARD_METRICS) >= 14
         
         required_metrics = [
             'ActiveControllerCount', 'OfflinePartitionsCount', 'KafkaDataLogsDiskUsed',
-            'ClientConnectionCount', 'PartitionCount', 'CpuUser', 'CpuSystem',
+            'ClientConnectionCount', 'ConnectionCount', 'ConnectionCreationRate',
+            'PartitionCount', 'CpuUser', 'CpuSystem',
             'UnderMinIsrPartitionCount', 'BytesInPerSec', 'BytesOutPerSec',
             'LeaderCount', 'MemoryUsed', 'MemoryFree', 'HeapMemoryAfterGC'
         ]

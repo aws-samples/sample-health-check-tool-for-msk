@@ -84,6 +84,14 @@ RECOMMENDATION_TEMPLATES = {
         'docs': ['https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html'],
         'estimated_impact': 'Prevent connection exhaustion and improve stability'
     },
+    'ConnectionCreationRate': {
+        'action': 'Implement connection pooling, increase client timeouts, and add exponential backoff with circuit breaker pattern',
+        'rationale': 'High connection creation rate indicates missing connection pooling, short timeouts, or client instability. New connections are expensive (CPU overhead) and IAM auth is limited to 100 connections/sec',
+        'impact': 'Increased CPU usage, potential connection throttling (IAM auth), and reduced cluster performance',
+        'docs': ['https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html',
+                 'https://docs.aws.amazon.com/msk/latest/developerguide/client-access.html'],
+        'estimated_impact': 'Reduce CPU overhead, prevent connection throttling, and improve overall cluster stability'
+    },
     'ConnectionChurn': {
         'action': 'Implement connection pooling and review client timeout configurations',
         'rationale': 'High connection churn creates unnecessary overhead and may indicate missing connection pooling or network issues',

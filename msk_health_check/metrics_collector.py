@@ -66,6 +66,7 @@ STANDARD_METRICS = {
     'BytesInPerSec': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
     'BytesOutPerSec': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
     'MessagesInPerSec': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
+    'ConnectionCreationRate': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
 }
 
 # Express Metrics (same as Standard - Express has per-broker metrics!)
@@ -92,6 +93,7 @@ EXPRESS_METRICS = {
     'MemoryUsed': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
     'MemoryFree': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
     'HeapMemoryAfterGC': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
+    'ConnectionCreationRate': {'namespace': 'AWS/Kafka', 'stat': 'Average', 'level': 'broker'},
 }
 
 

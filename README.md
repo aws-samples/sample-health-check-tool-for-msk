@@ -56,22 +56,22 @@ The tool is designed to be a starting point for building your own MSK monitoring
 
 ### Metrics Analyzed
 
-**Standard (Provisioned) - 18 Metrics:**
+**Standard (Provisioned) - 19 Metrics:**
 - `ActiveControllerCount`, `OfflinePartitionsCount`, `GlobalPartitionCount`, `GlobalTopicCount`
 - `CpuUser`, `CpuSystem`, `CpuIdle`
 - `MemoryUsed`, `MemoryFree`, `HeapMemoryAfterGC`
 - `KafkaDataLogsDiskUsed`
 - `LeaderCount`, `PartitionCount`, `UnderMinIsrPartitionCount`
 - `BytesInPerSec`, `BytesOutPerSec`, `MessagesInPerSec`
-- `ClientConnectionCount`, `ConnectionCount`
+- `ClientConnectionCount`, `ConnectionCount`, `ConnectionCreationRate`
 
-**Express (Serverless) - 18 Metrics:**
+**Express (Serverless) - 19 Metrics:**
 - `ActiveControllerCount`, `OfflinePartitionsCount`, `GlobalPartitionCount`, `GlobalTopicCount`
 - `CpuUser`, `CpuSystem`, `CpuIdle`
 - `MemoryUsed`, `MemoryFree`, `HeapMemoryAfterGC`
 - `LeaderCount`, `PartitionCount`, `UnderMinIsrPartitionCount`
 - `BytesInPerSec`, `BytesOutPerSec`, `MessagesInPerSec`
-- `ClientConnectionCount`, `ConnectionCount`
+- `ClientConnectionCount`, `ConnectionCount`, `ConnectionCreationRate`
 
 ### Health Score System
 
