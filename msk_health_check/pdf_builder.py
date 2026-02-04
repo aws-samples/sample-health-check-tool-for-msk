@@ -685,11 +685,11 @@ def create_important_links_section(styles) -> List:
     elements.append(Spacer(1, 0.3*inch))
     
     links = [
-        ('Best Practices', 'https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html'),
-        ('Reduce network traffic costs with rack awareness', 'https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html#bestpractices-rack-awareness'),
+        ('Best Practices for Standard brokers', 'https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html'),
+        ('Best practices for Express brokers', 'https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices-express.html'),
+        ('Best practices for Apache Kafka clients', 'https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices-kafka-client.html'),
         ('Amazon MSK Serverless', 'https://docs.aws.amazon.com/msk/latest/developerguide/serverless.html'),
         ('Amazon MSK Tiered Storage', 'https://docs.aws.amazon.com/msk/latest/developerguide/msk-tiered-storage.html'),
-        ('Amazon MSK AWS Graviton3 support', 'https://docs.aws.amazon.com/msk/latest/developerguide/graviton.html'),
         ('Safely remove Kafka brokers', 'https://docs.aws.amazon.com/msk/latest/developerguide/msk-remove-broker.html'),
         ('Monitoring with CloudWatch', 'https://docs.aws.amazon.com/msk/latest/developerguide/monitoring.html'),
         ('Security in Amazon MSK', 'https://docs.aws.amazon.com/msk/latest/developerguide/security.html'),
