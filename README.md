@@ -20,7 +20,7 @@ The tool is designed to be a starting point for building your own MSK monitoring
 
 ### Cluster Support
 - ✅ **MSK Provisioned (Standard)** - Full support with 18 metrics
-- ✅ **MSK Serverless (Express)** - Full support with 18 metrics
+- ✅ **MSK Provisioned (Express)** - Full support with 18 metrics
 
 ### Analysis Categories
 
@@ -65,7 +65,7 @@ The tool is designed to be a starting point for building your own MSK monitoring
 - `BytesInPerSec`, `BytesOutPerSec`, `MessagesInPerSec`
 - `ClientConnectionCount`, `ConnectionCount`, `ConnectionCreationRate`
 
-**Express (Serverless) - 19 Metrics:**
+**Express (Provisioned) - 19 Metrics:**
 - `ActiveControllerCount`, `OfflinePartitionsCount`, `GlobalPartitionCount`, `GlobalTopicCount`
 - `CpuUser`, `CpuSystem`, `CpuIdle`
 - `MemoryUsed`, `MemoryFree`, `HeapMemoryAfterGC`
@@ -340,7 +340,6 @@ mypy msk_health_check/
 - [AWS MSK Best Practices](https://docs.aws.amazon.com/msk/latest/developerguide/bestpractices.html)
 - [MSK Monitoring](https://docs.aws.amazon.com/msk/latest/developerguide/monitoring.html)
 - [MSK Broker Instance Sizes](https://docs.aws.amazon.com/msk/latest/developerguide/broker-instance-sizes.html)
-- [MSK Serverless](https://docs.aws.amazon.com/msk/latest/developerguide/serverless.html)
 - [Apache Kafka Documentation](https://kafka.apache.org/documentation/)
 
 ## Contributing
