@@ -168,28 +168,7 @@ msk-health-check \
 
 ## IAM Permissions
 
-The tool requires the following IAM permissions:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kafka:DescribeClusterV2",
-        "kafka:ListClusters",
-        "cloudwatch:GetMetricStatistics",
-        "cloudwatch:GetMetricWidgetImage",
-        "cloudwatch:ListMetrics"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-### Minimal IAM Policy
+The tool requires the following minimum IAM permissions:
 
 ```json
 {
@@ -200,6 +179,7 @@ The tool requires the following IAM permissions:
       "Effect": "Allow",
       "Action": [
         "kafka:DescribeClusterV2",
+        "kafka:ListKafkaVersions",
         "cloudwatch:GetMetricStatistics",
         "cloudwatch:GetMetricWidgetImage"
       ],

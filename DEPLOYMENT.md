@@ -195,21 +195,31 @@ aws lambda create-function \
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "MSKHealthCheck",
       "Effect": "Allow",
       "Action": [
         "kafka:DescribeClusterV2",
+        "kafka:ListKafkaVersions",
         "cloudwatch:GetMetricStatistics",
-        "cloudwatch:GetMetricWidgetImage",
-        "s3:PutObject",
+        "cloudwatch:GetMetricWidgetImage"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LambdaLogging",
+      "Effect": "Allow",
+      "Action": [
         "logs:CreateLogGroup",
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:logs:*:*:log-group:/aws/lambda/msk-health-check:*"
     }
   ]
 }
 ```
+
+> **Note:** If you want to upload reports to S3, add `s3:PutObject` scoped to your specific bucket ARN (e.g., `arn:aws:s3:::my-reports-bucket/*`) instead of using `*`.
 
 ### EventBridge Scheduled Execution
 
