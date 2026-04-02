@@ -115,7 +115,7 @@ The tool is designed to be a starting point for building your own MSK monitoring
 ```bash
 # Clone the repository
 git clone https://github.com/aws-samples/sample-health-check-tool-for-msk.git
-cd msk-health-check
+cd sample-health-check-tool-for-msk
 
 # Install dependencies
 pip install -r requirements.txt
