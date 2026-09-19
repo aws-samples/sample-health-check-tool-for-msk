@@ -56,8 +56,11 @@ def _annotations(metric_name: str, cluster_info: ClusterInfo) -> List[Dict[str, 
         if maximum:
             line(maximum * mb, f'throttle quota {maximum:g} MB/s')
     elif metric_name == 'PartitionCount' and limits:
-        line(limits.partitions_recommended, f'recommended {limits.partitions_recommended}', '#ff7f0e')
-        line(limits.partitions_max, f'maximum {limits.partitions_max}')
+        if limits.partitions_recommended == limits.partitions_max:
+            line(limits.partitions_max, f'recommended = maximum {limits.partitions_max}')
+        else:
+            line(limits.partitions_recommended, f'recommended {limits.partitions_recommended}', '#ff7f0e')
+            line(limits.partitions_max, f'maximum {limits.partitions_max}')
     elif metric_name == 'ClientConnectionCount' and iam:
         quota = limits.iam_connections_per_broker if limits else 3000
         line(quota, f'IAM quota {quota} per broker')
