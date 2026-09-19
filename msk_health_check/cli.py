@@ -108,16 +108,16 @@ def main(argv=None) -> int:
 
         days_back = args.days or 30
         if cluster_info.creation_time:
-            age_days = (datetime.now(timezone.utc) - cluster_info.creation_time).days
+            age_days = (datetime.now(timezone.utc) - cluster_info.creation_time).total_seconds() / 86400
             if age_days < days_back:
-                days_back = max(1, age_days)
-                logger.info(f"Cluster is {age_days} days old; collecting {days_back} day(s) of metrics")
+                logger.info(f"Cluster is {age_days:.1f} days old; the window starts at its creation time")
 
         logger.info("Collecting metrics from CloudWatch")
         metrics = collect_metrics(clients.cloudwatch_client, args.cluster_arn, cluster_info.broker_count,
                                   cluster_info.cluster_type, days_back,
                                   monitoring_level=cluster_info.enhanced_monitoring_level,
-                                  auth_methods=cluster_info.authentication_methods)
+                                  auth_methods=cluster_info.authentication_methods,
+                                  not_before=cluster_info.creation_time)
         logger.info(f"Collected {len(metrics.metrics)} metric types; {len(metrics.not_published)} not published")
 
         logger.info("Analysing metrics and configuration")

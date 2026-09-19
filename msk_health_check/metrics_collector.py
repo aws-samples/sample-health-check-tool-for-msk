@@ -208,11 +208,23 @@ def choose_period(days_back: float) -> int:
 
 
 def compute_window(days_back: int, period_seconds: int = DEFAULT_PERIOD_SECONDS,
-                   now: Optional[datetime] = None) -> Tuple[datetime, datetime]:
-    """Return an aligned [start, end) window ending at the last complete period."""
+                   now: Optional[datetime] = None, not_before: Optional[datetime] = None) -> Tuple[datetime, datetime]:
+    """Return an aligned [start, end) window ending at the last complete period.
+
+    ``not_before`` (typically the cluster creation time) clamps the start so that coverage is
+    measured against the time the cluster existed, not against the requested number of days.
+    """
     now = now or datetime.now(timezone.utc)
     end_time = _floor_to_period(now, period_seconds)
     start_time = end_time - timedelta(days=days_back)
+    if not_before is not None:
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+        floor_nb = _floor_to_period(not_before, period_seconds)
+        if floor_nb > start_time:
+            start_time = floor_nb
+    if start_time >= end_time:
+        start_time = end_time - timedelta(seconds=period_seconds)
     return start_time, end_time
 
 
@@ -454,6 +466,7 @@ def collect_metrics(
     monitoring_level: Optional[str] = None,
     auth_methods: Optional[List[str]] = None,
     period_seconds: Optional[int] = None,
+    not_before: Optional[datetime] = None,
 ) -> MetricsCollection:
     """Collect all catalog metrics for a cluster.
 
@@ -467,8 +480,12 @@ def collect_metrics(
         auth_methods: authentication methods enabled on the cluster
         period_seconds: CloudWatch period per datapoint
     """
+    if not_before is not None:
+        nb = not_before if not_before.tzinfo else not_before.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - nb).total_seconds() / 86400
+        days_back = max(min(days_back, age_days), 1 / 24)
     period_seconds = period_seconds or choose_period(days_back)
-    start_time, end_time = compute_window(days_back, period_seconds)
+    start_time, end_time = compute_window(days_back, period_seconds, not_before=not_before)
     cluster_name = cluster_arn.split('/')[-2]
     to_query, not_published = metrics_for_cluster(cluster_type, monitoring_level, auth_methods)
 

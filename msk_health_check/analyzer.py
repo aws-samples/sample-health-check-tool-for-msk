@@ -231,7 +231,9 @@ def analyze_active_controller_count(metric: MetricData) -> List[Finding]:
     sums, counts = metric.series.get('Sum'), metric.series.get('SampleCount')
     emitters = max(1, round(metric.emitters_per_minute))
     if sums and counts and len(sums) == len(counts):
-        values = [(sm * emitters / c) if c else 0.0 for sm, c in zip(sums, counts)]
+        # ignore sparse buckets (cluster creation, window edges) where a few samples distort the ratio
+        full = 0.5 * float(np.median(counts)) if counts else 0.0
+        values = [(sm * emitters / c) for sm, c in zip(sums, counts) if c and c >= full] or list(metric.values)
     else:
         values = list(metric.values)
     floor_val = min(values) if values else 0.0
@@ -711,6 +713,7 @@ def analyze_connection_creation_rate(brokers: List[MetricData], cluster_info: Cl
     limits = ref.get_instance_limits(cluster_info.instance_type)
     quota = limits.iam_connection_rate_per_sec if limits else 100.0
     iam = 'IAM' in cluster_info.authentication_methods
+    mixed = iam and any(m != 'IAM' for m in cluster_info.authentication_methods)
     p95 = {m.broker_id: m.statistics['p95'] for m in brokers}
     peak = {m.broker_id: m.statistics['max'] for m in brokers}
     avg = {m.broker_id: m.statistics['avg'] for m in brokers}
@@ -718,10 +721,13 @@ def analyze_connection_creation_rate(brokers: List[MetricData], cluster_info: Cl
     throttled = {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in (too_many or [])}
     throttled_brokers = [b for b, v in throttled.items() if v > 0]
     ev = {'p95_per_broker': p95, 'peak_per_broker': peak, 'avg_per_broker': avg, 'iam_quota_per_sec': quota,
-          'iam_too_many_connections_peak': throttled}
+          'iam_too_many_connections_peak': throttled,
+          'note': 'ConnectionCreationRate aggregates every client listener; the quota applies to IAM listeners' if mixed else ''}
     common = dict(check_id='connection_creation_rate', metric_name='ConnectionCreationRate', category=Category.PERFORMANCE,
                   source='quotas', chart='ConnectionCreationRate', threshold=quota if iam else None,
-                  threshold_text=f'{quota:g} new connections/s per broker (IAM quota)' if iam else 'no enforced quota')
+                  confidence='medium' if mixed else 'high',
+                  threshold_text=(f'{quota:g} new connections/s per broker (IAM quota' + (', all listeners counted)' if mixed else ')'))
+                  if iam else 'no enforced quota')
     if throttled_brokers:
         return [_finding(severity=Severity.CRITICAL, title='IAM connection attempts were throttled',
                          description=(f'IAMTooManyConnections is above 0 on broker(s) {", ".join(throttled_brokers)}: clients '
