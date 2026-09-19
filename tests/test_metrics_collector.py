@@ -39,8 +39,7 @@ class TestQueryMetricWithRetry:
         end_time = datetime.utcnow()
         
         result = query_metric_with_retry(
-            mock_client, 'CpuUser', 
-            'arn:aws:kafka:us-east-1:123456789012:cluster/test-cluster/uuid',
+            mock_client, 'CpuUser', 'test-cluster', '1',
             start_time, end_time
         )
         
@@ -61,8 +60,7 @@ class TestQueryMetricWithRetry:
         end_time = datetime.utcnow()
         
         result = query_metric_with_retry(
-            mock_client, 'CpuUser',
-            'arn:aws:kafka:us-east-1:123456789012:cluster/test-cluster/uuid',
+            mock_client, 'CpuUser', 'test-cluster', '1',
             start_time, end_time
         )
         
@@ -76,8 +74,7 @@ class TestQueryMetricWithRetry:
         end_time = datetime.utcnow()
         
         result = query_metric_with_retry(
-            mock_client, 'CpuUser',
-            'arn:aws:kafka:us-east-1:123456789012:cluster/test-cluster/uuid',
+            mock_client, 'CpuUser', 'test-cluster', '1',
             start_time, end_time, max_retries=3
         )
         
@@ -98,8 +95,7 @@ class TestQueryMetricWithRetry:
         end_time = datetime.utcnow()
         
         result = query_metric_with_retry(
-            mock_client, 'CpuUser',
-            'arn:aws:kafka:us-east-1:123456789012:cluster/test-cluster/uuid',
+            mock_client, 'CpuUser', 'test-cluster', '1',
             start_time, end_time, max_retries=3
         )
         

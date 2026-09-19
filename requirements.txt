@@ -4,8 +4,8 @@ boto3>=1.28.0
 # Data visualization
 matplotlib>=3.7.0
 
-# PDF generation
-reportlab>=3.6.0,<4.0.0
+# PDF generation (3.6+ and 4.x share the platypus API used here; 3.x has no wheels for Python 3.13)
+reportlab>=3.6.0,<5.0.0
 
 # Data processing
 pandas>=2.0.0

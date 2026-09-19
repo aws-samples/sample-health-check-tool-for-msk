@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-19
+
+### Added
+- Explicit "not assessed" state (with reason) for checks that cannot run; data quality section with coverage, unpublished metrics and collection errors
+- Checks: heap after GC, disk growth projection, under-replicated partitions, IAMTooManyConnections, encryption in transit / in cluster / at rest, public access, storage auto scaling via Application Auto Scaling, intelligent rebalancing (Express, via `Provisioned.Rebalancing`), Kafka version status from ListKafkaVersions, right-sizing signal
+- Metric catalog with monitoring-level requirements, ListMetrics discovery and per-listener connection metrics
+- JSON manifest next to the PDF; `--compare-with` (new / resolved / persisting findings), `--redact`, `--workload`, `--days`, `--no-network`, `--no-manifest`
+- PDF: real table of contents and bookmarks, action plan with priority, severity and confidence, observed value vs threshold and source per finding, threshold lines on charts, per-broker statistics tables, methodology section
+
+### Changed
+- Status label bounded by the worst finding; informational findings no longer reduce the score
+- CloudWatch queries return all five statistics; Minimum for ActiveControllerCount, Maximum for partition-state metrics; connection metrics read as Sum per minute (broker total)
+- CPU User + System aligned by timestamp before percentiles; throughput, partitions and connections evaluated per broker
+- Broker size limits with provenance and confidence in `reference.py`; unknown sizes report not assessed instead of a default limit; disk threshold aligned with the documented 85% action level
+- Recommendations consolidated per check with confirm / verify steps and documentation links; priority separated from severity
+- reportlab pin relaxed to `<5.0.0`; package version 1.1.0
+
+### Fixed
+- Analyzers for disk, heap, under-min-ISR and memory that existed but were never executed
+- Throughput check that only looked at the first broker
+- Storage auto scaling read from the provisioned-throughput flag
+- `ConnectionCreationRate` treated as a DEFAULT-level metric
+- Charts inserted with a different aspect ratio than rendered
+
 ## [1.0.2] - 2025-11-28
 
 ### Added

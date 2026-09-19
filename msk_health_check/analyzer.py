@@ -1,29 +1,26 @@
-"""Metrics analysis module for MSK Health Check Report."""
+"""Metrics and configuration analysis.
+
+Each check produces one Finding with an explicit status. A check that cannot run (metric not
+published, permission missing, broker size not in the catalog) produces a NOT_ASSESSED finding
+instead of silently passing, so the report can show what was and was not evaluated.
+"""
 
 import logging
-from dataclasses import dataclass
+import re
+import time
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .cluster_info import ClusterInfo
-from .metrics_collector import MetricData, MetricsCollection
+from .cluster_info import ClusterInfo, parse_version
+from .metrics_collector import MetricData, MetricsCollection, align_series, summarize, metric_title
+from . import reference as ref
 
 logger = logging.getLogger(__name__)
-
-
-def get_cluster_metric(metrics_list: List[MetricData]) -> Optional[MetricData]:
-    """Get cluster-level metric (broker_id is None)."""
-    for metric in metrics_list:
-        if metric.broker_id is None:
-            return metric
-    return None
-
-
-def get_broker_metrics(metrics_list: List[MetricData]) -> List[MetricData]:
-    """Get all per-broker metrics."""
-    return [m for m in metrics_list if m.broker_id is not None]
 
 
 class Severity(Enum):
@@ -32,6 +29,7 @@ class Severity(Enum):
     WARNING = "warning"
     INFORMATIONAL = "informational"
     HEALTHY = "healthy"
+    NOT_ASSESSED = "not_assessed"
 
 
 class Category(Enum):
@@ -42,17 +40,41 @@ class Category(Enum):
     COST = "cost"
 
 
+CATEGORY_WEIGHTS = {
+    Category.RELIABILITY: 0.35,
+    Category.PERFORMANCE: 0.30,
+    Category.SECURITY: 0.20,
+    Category.COST: 0.15,
+}
+
+SEVERITY_ORDER = {Severity.CRITICAL: 0, Severity.WARNING: 1, Severity.INFORMATIONAL: 2,
+                  Severity.HEALTHY: 3, Severity.NOT_ASSESSED: 4}
+
+
 @dataclass
 class Finding:
-    """Individual analysis result."""
-    metric_name: str
+    """Result of one check."""
+    metric_name: str                      # metric or check key (kept for compatibility)
     severity: Severity
     category: Category
     title: str
     description: str
     current_value: Optional[float]
     threshold_value: Optional[float]
-    evidence: Dict[str, Any]  # Supporting data for the finding
+    evidence: Dict[str, Any]
+    check_id: str = ''
+    confidence: str = 'high'              # high | medium | low
+    source: str = ''                      # key in reference.DOCS or a label
+    affected_brokers: List[str] = field(default_factory=list)
+    observed: str = ''                    # human-readable observed value
+    threshold: str = ''                   # human-readable threshold
+    section: str = 'metric'               # metric | configuration | derived
+    chart_metric: Optional[str] = None    # chart to attach in the report
+    reason: str = ''                      # why the check was not assessed
+
+    @property
+    def source_url(self) -> str:
+        return ref.DOCS.get(self.source, self.source if self.source.startswith('http') else '')
 
 
 @dataclass
@@ -61,1873 +83,1048 @@ class AnalysisResult:
     cluster_info: ClusterInfo
     metrics: MetricsCollection
     findings: List[Finding]
-    overall_health_score: float  # 0-100
+    overall_health_score: float           # 0-100
+    category_scores: Dict[str, float] = field(default_factory=dict)
+    overall_status: str = 'Healthy'       # Healthy | Needs Attention | Critical
+    checks_total: int = 0
+    checks_assessed: int = 0
+    rules_version: str = ref.RULES_VERSION
+    workload: str = 'production'
+    version_reference: Dict[str, Any] = field(default_factory=dict)
 
 
-def analyze_metrics(
-    cluster_info: ClusterInfo,
-    metrics: MetricsCollection
-) -> AnalysisResult:
-    """
-    Analyze all metrics against best practices.
-    Metrics are collected per-broker to detect imbalances.
-    
-    Args:
-        cluster_info: Cluster configuration
-        metrics: Collected metrics (per-broker and cluster-level)
-        
-    Returns:
-        AnalysisResult with findings and health score
-    """
-    findings = []
-    
-    # Analyze cluster-level metrics
-    if 'ActiveControllerCount' in metrics.metrics:
-        metric = get_cluster_metric(metrics.metrics['ActiveControllerCount'])
-        if metric:
-            findings.extend(analyze_active_controller_count(metric))
-    
-    if 'GlobalPartitionCount' in metrics.metrics:
-        metric = get_cluster_metric(metrics.metrics['GlobalPartitionCount'])
-        if metric:
-            findings.extend(analyze_partition_count(metric, cluster_info))
-    
-    if 'GlobalTopicCount' in metrics.metrics:
-        metric = get_cluster_metric(metrics.metrics['GlobalTopicCount'])
-        if metric:
-            findings.extend(analyze_topic_count(metric, cluster_info))
-    
-    if 'OfflinePartitionsCount' in metrics.metrics:
-        metric = get_cluster_metric(metrics.metrics['OfflinePartitionsCount'])
-        if metric:
-            findings.extend(analyze_offline_partitions(metric))
-    
-    if 'ClientConnectionCount' in metrics.metrics:
-        # Can be cluster or per-broker
-        cluster_metric = get_cluster_metric(metrics.metrics['ClientConnectionCount'])
-        broker_metrics_list = get_broker_metrics(metrics.metrics['ClientConnectionCount'])
-        if cluster_metric:
-            findings.extend(analyze_connection_count(cluster_metric, cluster_info))
-        elif broker_metrics_list:
-            findings.extend(analyze_per_broker_metrics(broker_metrics_list, 'ClientConnectionCount', cluster_info))
-    
-    # Analyze per-broker metrics
-    for metric_name in ['CpuUser', 'CpuSystem', 'MemoryUsed', 'MemoryFree', 'HeapMemoryAfterGC',
-                        'KafkaDataLogsDiskUsed', 'LeaderCount', 'PartitionCount', 
-                        'UnderMinIsrPartitionCount', 'BytesInPerSec', 'BytesOutPerSec', 'MessagesInPerSec',
-                        'ConnectionCount', 'ConnectionCreationRate']:
-        if metric_name in metrics.metrics:
-            broker_metrics_list = get_broker_metrics(metrics.metrics[metric_name])
-            if broker_metrics_list:
-                findings.extend(analyze_per_broker_metrics(broker_metrics_list, metric_name, cluster_info))
-    
-    # Analyze CPU total (User + System) - must be < 60%
-    cpu_user_list = metrics.metrics.get('CpuUser', [])
-    cpu_system_list = metrics.metrics.get('CpuSystem', [])
-    if cpu_user_list and cpu_system_list:
-        findings.extend(analyze_cpu_total(cpu_user_list, cpu_system_list))
-    
-    # Analyze throughput against network limits
-    bytes_in_list = metrics.metrics.get('BytesInPerSec', [])
-    bytes_out_list = metrics.metrics.get('BytesOutPerSec', [])
-    bytes_in_metric = bytes_in_list[0] if bytes_in_list else None
-    bytes_out_metric = bytes_out_list[0] if bytes_out_list else None
-    if bytes_in_metric or bytes_out_metric:
-        findings.extend(analyze_throughput(bytes_in_metric, bytes_out_metric, cluster_info))
-    
-    # Analyze cluster configuration
-    findings.extend(analyze_authentication_methods(cluster_info))
-    findings.extend(analyze_instance_type(cluster_info, metrics))
-    findings.extend(analyze_kafka_version(cluster_info))
-    findings.extend(analyze_availability_zones(cluster_info))
-    findings.extend(analyze_storage_auto_scaling(cluster_info))
-    findings.extend(analyze_logging_configuration(cluster_info))
-    findings.extend(analyze_enhanced_monitoring(cluster_info))
-    # findings.extend(analyze_intelligent_rebalancing(cluster_info))  # Disabled: API doesn't return Rebalancing field
-    
-    # Calculate overall health score
-    health_score = _calculate_health_score(findings)
-    
-    logger.info(f"Analysis complete: {len(findings)} findings, health score: {health_score}")
-    
-    return AnalysisResult(
-        cluster_info=cluster_info,
-        metrics=metrics,
-        findings=findings,
-        overall_health_score=health_score
-    )
+# --------------------------------------------------------------------------- helpers
+
+def get_cluster_metric(metric_list: List[MetricData]) -> Optional[MetricData]:
+    for m in metric_list or []:
+        if m.broker_id is None:
+            return m
+    return None
 
 
-def _calculate_health_score(findings: List[Finding]) -> float:
-    """
-    Calculate overall health score from findings using category-based approach.
-    
-    Each category starts at 100 and is reduced based on severity of issues:
-    - Reliability: 35% weight (critical for availability)
-    - Performance: 30% weight (impacts user experience)
-    - Security: 20% weight (compliance and protection)
-    - Cost Optimization: 15% weight (efficiency)
-    
-    Args:
-        findings: List of findings
-        
-    Returns:
-        Health score from 0-100
-    """
-    if not findings:
-        return 100.0
-    
-    # Group findings by category
-    category_findings = {
-        Category.RELIABILITY: [],
-        Category.PERFORMANCE: [],
-        Category.SECURITY: [],
-        Category.COST: []
-    }
-    
-    for finding in findings:
-        if finding.category in category_findings:
-            category_findings[finding.category].append(finding)
-    
-    # Category weights (must sum to 1.0)
-    category_weights = {
-        Category.RELIABILITY: 0.35,
-        Category.PERFORMANCE: 0.30,
-        Category.SECURITY: 0.20,
-        Category.COST: 0.15
-    }
-    
-    # Calculate score for each category
-    category_scores = {}
-    for category, weight in category_weights.items():
-        category_scores[category] = _calculate_category_score(category_findings[category])
-    
-    # Weighted average
-    total_score = sum(category_scores[cat] * weight for cat, weight in category_weights.items())
-    
-    return round(total_score, 1)
+def get_broker_metrics(metric_list: List[MetricData]) -> List[MetricData]:
+    return [m for m in metric_list or [] if m.broker_id is not None]
 
+
+def _fmt(value: float, unit: str = '') -> str:
+    if unit in ('Percent', '%'):
+        return f'{value:.1f}%'
+    if unit in ('Bytes/Second', 'MB/s'):
+        return f'{value / (1024 * 1024):.2f} MB/s' if unit == 'Bytes/Second' else f'{value:.2f} MB/s'
+    if unit == 'Bytes':
+        return f'{value / (1024 ** 3):.2f} GiB'
+    if abs(value) >= 100 or float(value).is_integer():
+        return f'{value:,.0f}'
+    return f'{value:.2f}'
+
+
+def _brokers(metrics: List[MetricData]) -> List[str]:
+    return [str(m.broker_id) for m in metrics if m.broker_id is not None]
+
+
+def _missing_reason(metrics: MetricsCollection, metric_name: str) -> str:
+    if metric_name in metrics.not_published:
+        return f'{metric_name}: {metrics.not_published[metric_name]}'
+    if metric_name in metrics.collection_errors:
+        return f'{metric_name}: collection failed ({"; ".join(metrics.collection_errors[metric_name][:3])})'
+    if metric_name not in metrics.attempted_metrics:
+        return f'{metric_name}: not applicable to this cluster type'
+    return f'{metric_name}: no datapoints in the analysis window'
+
+
+def not_assessed(check_id: str, metric_name: str, category: Category, title: str, reason: str,
+                 section: str = 'metric', source: str = '') -> Finding:
+    return Finding(metric_name=metric_name, severity=Severity.NOT_ASSESSED, category=category, title=title,
+                   description=f'This check could not be evaluated. {reason}', current_value=None,
+                   threshold_value=None, evidence={'reason': reason}, check_id=check_id, confidence='high',
+                   source=source, section=section, reason=reason)
+
+
+def _finding(check_id: str, metric_name: str, severity: Severity, category: Category, title: str,
+             description: str, *, value: Optional[float] = None, threshold: Optional[float] = None,
+             evidence: Optional[Dict[str, Any]] = None, confidence: str = 'high', source: str = '',
+             brokers: Optional[List[str]] = None, observed: str = '', threshold_text: str = '',
+             section: str = 'metric', chart: Optional[str] = None) -> Finding:
+    return Finding(metric_name=metric_name, severity=severity, category=category, title=title,
+                   description=description, current_value=value, threshold_value=threshold,
+                   evidence=evidence or {}, check_id=check_id, confidence=confidence, source=source,
+                   affected_brokers=brokers or [], observed=observed, threshold=threshold_text,
+                   section=section, chart_metric=chart)
+
+
+def _imbalance(values: Dict[str, float], threshold_pct: float, min_activity: float) -> Dict[str, Any]:
+    """Deviation of the most loaded broker from the mean, or a reason why it is not relevant."""
+    if len(values) < 2:
+        return {'relevant': False, 'reason': 'fewer than two brokers'}
+    mean = float(np.mean(list(values.values())))
+    if mean <= 0 or mean < min_activity:
+        return {'relevant': False, 'reason': f'activity too low to matter (mean {mean:.1f} < {min_activity:g})',
+                'mean': mean}
+    hottest = max(values, key=values.get)
+    coldest = min(values, key=values.get)
+    deviation = (values[hottest] - mean) / mean * 100.0
+    return {'relevant': True, 'mean': mean, 'max': values[hottest], 'min': values[coldest],
+            'hottest': hottest, 'coldest': coldest, 'deviation_pct': deviation,
+            'imbalanced': deviation > threshold_pct, 'threshold_pct': threshold_pct}
+
+
+def _linear_growth_per_day(metric: MetricData) -> Optional[float]:
+    """Slope (units per day) of a least-squares fit over the metric series."""
+    if len(metric.values) < 24:
+        return None
+    t0 = metric.timestamps[0]
+    days = np.array([(ts - t0).total_seconds() / 86400.0 for ts in metric.timestamps])
+    if days[-1] - days[0] < 1.0:
+        return None
+    slope, _ = np.polyfit(days, np.array(metric.values, dtype=float), 1)
+    return float(slope)
+
+
+# --------------------------------------------------------------------------- scoring
 
 def _calculate_category_score(findings: List[Finding]) -> float:
-    """
-    Calculate score for a specific category.
-    
-    Uses percentage-based deduction to prevent negative scores:
-    - CRITICAL: -40% of current score
-    - WARNING: -15% of current score
-    - INFORMATIONAL: -5% of current score
-    - HEALTHY: +0%
-    
-    Args:
-        findings: List of findings for this category
-        
-    Returns:
-        Category score from 0-100
-    """
-    if not findings:
-        return 100.0
-    
+    """100 reduced multiplicatively: x0.60 per CRITICAL, x0.85 per WARNING. Informational findings
+    and checks that were not assessed do not change the score."""
     score = 100.0
-    
-    # Count by severity
-    critical_count = sum(1 for f in findings if f.severity == Severity.CRITICAL)
-    warning_count = sum(1 for f in findings if f.severity == Severity.WARNING)
-    info_count = sum(1 for f in findings if f.severity == Severity.INFORMATIONAL)
-    
-    # Apply percentage-based deductions (multiplicative to prevent negative)
-    for _ in range(critical_count):
-        score *= 0.60  # -40% per critical issue
-    
-    for _ in range(warning_count):
-        score *= 0.85  # -15% per warning
-    
-    for _ in range(info_count):
-        score *= 0.95  # -5% per informational
-    
+    for f in findings:
+        if f.severity == Severity.CRITICAL:
+            score *= 0.60
+        elif f.severity == Severity.WARNING:
+            score *= 0.85
     return max(0.0, score)
 
 
+def _calculate_category_scores(findings: List[Finding]) -> Dict[Category, float]:
+    grouped: Dict[Category, List[Finding]] = {c: [] for c in CATEGORY_WEIGHTS}
+    for f in findings:
+        if f.category in grouped:
+            grouped[f.category].append(f)
+    return {c: _calculate_category_score(fs) for c, fs in grouped.items()}
+
+
+def _calculate_health_score(findings: List[Finding]) -> float:
+    """Weighted average of the category scores (Reliability 35%, Performance 30%, Security 20%, Cost 15%)."""
+    if not findings:
+        return 100.0
+    scores = _calculate_category_scores(findings)
+    return round(sum(scores[c] * w for c, w in CATEGORY_WEIGHTS.items()), 1)
+
+
+def overall_status(findings: List[Finding]) -> str:
+    """Status label bounded by the worst severity: a critical finding can never read as Healthy."""
+    severities = {f.severity for f in findings}
+    if Severity.CRITICAL in severities:
+        return 'Critical'
+    if Severity.WARNING in severities:
+        return 'Needs Attention'
+    return 'Healthy'
+
+
+# --------------------------------------------------------------------------- reliability checks
+
 def analyze_active_controller_count(metric: MetricData) -> List[Finding]:
-    """
-    Should be exactly 1. Only alert if minimum value in the period was < 1.
-    This indicates the cluster lost its controller at some point.
-    """
-    findings = []
-    min_val = metric.statistics['min']
-    max_val = metric.statistics['max']
-    
-    if min_val < 1.0:
-        findings.append(Finding(
-            metric_name='ActiveControllerCount',
-            severity=Severity.CRITICAL,
-            category=Category.RELIABILITY,
-            title='Active Controller Count Dropped Below 1',
-            description=f'Active controller count dropped to {min_val:.0f} during the monitoring period. This indicates a cluster stability issue.',
-            current_value=min_val,
-            threshold_value=1.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    elif max_val > 1.0:
-        findings.append(Finding(
-            metric_name='ActiveControllerCount',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Multiple Active Controllers Detected',
-            description=f'Active controller count reached {max_val:.0f}. Expected exactly 1.',
-            current_value=max_val,
-            threshold_value=1.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='ActiveControllerCount',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='Active Controller Count Normal',
-            description='Active controller count is healthy at 1 throughout the monitoring period.',
-            current_value=max_val,
-            threshold_value=1.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
-
-
-def analyze_topic_count(metric: MetricData, cluster_info: ClusterInfo) -> List[Finding]:
-    """Analyze if topic count is appropriate for cluster."""
-    findings = []
-    
-    current_topics = int(metric.statistics['avg'])
-    
-    # Topic limits are generally not a hard constraint, but good practice
-    # Recommend keeping under 1000 topics for operational simplicity
-    if current_topics > 1000:
-        findings.append(Finding(
-            metric_name='GlobalTopicCount',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='High Topic Count',
-            description=f'Cluster has {current_topics} topics. High topic counts can increase operational complexity.',
-            current_value=float(current_topics),
-            threshold_value=1000.0,
-            evidence={'current_topics': current_topics}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='GlobalTopicCount',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='Topic Count OK',
-            description=f'Cluster has {current_topics} topics, within recommended range.',
-            current_value=float(current_topics),
-            threshold_value=1000.0,
-            evidence={'current_topics': current_topics}
-        ))
-    
-    return findings
+    """Exactly one controller must be active. Uses the Minimum statistic so a brief drop is not
+    hidden inside an hourly bucket."""
+    floor_val = metric.statistics.get('floor', metric.statistics['min'])
+    peak_val = metric.statistics.get('peak', metric.statistics['max'])
+    hours_without = sum(1 for v in metric.values if v < 1.0)
+    ev = {'statistics': metric.statistics, 'hours_without_controller': hours_without}
+    common = dict(check_id='active_controller', metric_name='ActiveControllerCount', category=Category.RELIABILITY,
+                  source='best_practices', chart='ActiveControllerCount', threshold=1.0, threshold_text='exactly 1')
+    if floor_val < 1.0:
+        return [_finding(severity=Severity.CRITICAL, title='Cluster lost its active controller during the window',
+                         description=(f'ActiveControllerCount dropped below 1 in {hours_without} hourly bucket(s). '
+                                      'Without a controller, partition leadership changes and topic operations stall. '
+                                      'Broker restarts or maintenance can explain short gaps; repeated gaps suggest '
+                                      'controller instability.'),
+                         value=floor_val, evidence=ev, observed=f'minimum {floor_val:.0f}', **common)]
+    if round(peak_val) >= 2:
+        return [_finding(severity=Severity.WARNING, title='More than one active controller reported',
+                         description=(f'ActiveControllerCount reached {peak_val:.0f}. Two controllers can appear briefly '
+                                      'during a controller move; a persistent value above 1 indicates a split view '
+                                      'of the cluster that needs investigation.'),
+                         value=peak_val, evidence=ev, observed=f'maximum {peak_val:.0f}', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Exactly one active controller throughout the window',
+                     description='ActiveControllerCount stayed at 1 in every hourly bucket.',
+                     value=1.0, evidence=ev, observed='1', **common)]
 
 
 def analyze_offline_partitions(metric: MetricData) -> List[Finding]:
-    """Should be 0."""
-    findings = []
-    max_val = metric.statistics['max']
-    
-    if max_val > 0:
-        findings.append(Finding(
-            metric_name='OfflinePartitionsCount',
-            severity=Severity.CRITICAL,
-            category=Category.RELIABILITY,
-            title='Offline Partitions Detected',
-            description=f'Detected up to {int(max_val)} offline partitions. This indicates data unavailability.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
+    """Any offline partition means data unavailability. Uses the Maximum statistic."""
+    peak_val = metric.statistics.get('peak', metric.statistics['max'])
+    hours_affected = sum(1 for v in metric.values if v > 0)
+    last_ts = next((ts for ts, v in zip(reversed(metric.timestamps), reversed(metric.values)) if v > 0), None)
+    ev = {'statistics': metric.statistics, 'hours_affected': hours_affected,
+          'last_occurrence': last_ts.isoformat() if last_ts else None}
+    common = dict(check_id='offline_partitions', metric_name='OfflinePartitionsCount', category=Category.RELIABILITY,
+                  source='best_practices', chart='OfflinePartitionsCount', threshold=0.0, threshold_text='0')
+    if peak_val > 0:
+        current = metric.values[-1] if metric.values else 0
+        sev = Severity.CRITICAL
+        when = f'last seen {last_ts.strftime("%Y-%m-%d %H:%M UTC")}' if last_ts else ''
+        desc = (f'Up to {peak_val:.0f} partition(s) were offline in {hours_affected} hourly bucket(s) ({when}). '
+                'Offline partitions have no leader, so producers and consumers of those partitions fail. '
+                'Typical causes are a broker outage with replication factor 1, or all replicas of a partition '
+                'unavailable at once. ')
+        desc += ('Partitions are still offline now.' if current > 0 else
+                 'No partition is offline at the end of the window; confirm the root cause to prevent recurrence.')
+        return [_finding(severity=sev, title='Offline partitions detected', description=desc, value=peak_val,
+                         evidence=ev, observed=f'peak {peak_val:.0f}', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='No offline partitions',
+                     description='OfflinePartitionsCount was 0 in every hourly bucket.',
+                     value=0.0, evidence=ev, observed='0', **common)]
+
+
+def analyze_under_min_isr(brokers: List[MetricData]) -> List[Finding]:
+    """UnderMinIsrPartitionCount per broker (Maximum statistic). Current > 0 is critical."""
+    current = {m.broker_id: (m.values[-1] if m.values else 0.0) for m in brokers}
+    historical = {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in brokers}
+    now_affected = [b for b, v in current.items() if v > 0]
+    hist_affected = [b for b, v in historical.items() if v > 0]
+    ev = {'current_per_broker': current, 'peak_per_broker': historical}
+    common = dict(check_id='under_min_isr', metric_name='UnderMinIsrPartitionCount', category=Category.RELIABILITY,
+                  source='best_practices', chart='UnderMinIsrPartitionCount', threshold=0.0, threshold_text='0')
+    if now_affected:
+        total = sum(current[b] for b in now_affected)
+        return [_finding(severity=Severity.CRITICAL, title='Partitions currently below min.insync.replicas',
+                         description=(f'{total:.0f} partition(s) on broker(s) {", ".join(now_affected)} are below the '
+                                      'configured minimum in-sync replicas in the latest hour. Producers with acks=all '
+                                      'receive NotEnoughReplicas errors and durability is reduced until replicas catch up.'),
+                         value=total, evidence=ev, brokers=now_affected, observed=f'{total:.0f} now', **common)]
+    if hist_affected:
+        peak = max(historical.values())
+        return [_finding(severity=Severity.WARNING, title='Partitions were below min.insync.replicas earlier in the window',
+                         description=(f'Up to {peak:.0f} partition(s) fell below min ISR on broker(s) '
+                                      f'{", ".join(hist_affected)}; none are affected in the latest hour. Broker restarts '
+                                      '(patching, size updates) explain short episodes; recurring episodes indicate a '
+                                      'follower that cannot keep up.'),
+                         value=peak, evidence=ev, brokers=hist_affected, observed=f'peak {peak:.0f}', confidence='medium',
+                         **common)]
+    return [_finding(severity=Severity.HEALTHY, title='All partitions met min.insync.replicas',
+                     description='UnderMinIsrPartitionCount was 0 on every broker throughout the window.',
+                     value=0.0, evidence=ev, observed='0', **common)]
+
+
+def analyze_under_replicated(brokers: List[MetricData]) -> List[Finding]:
+    """UnderReplicatedPartitions per broker. Sustained URP indicates replication lag."""
+    peaks = {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in brokers}
+    hours_total = max((len(m.values) for m in brokers), default=0)
+    hours_affected = {m.broker_id: sum(1 for v in m.values if v > 0) for m in brokers}
+    affected = [b for b, v in peaks.items() if v > 0]
+    worst_hours = max(hours_affected.values(), default=0)
+    current = any((m.values[-1] if m.values else 0) > 0 for m in brokers)
+    ev = {'peak_per_broker': peaks, 'hours_affected_per_broker': hours_affected, 'hours_in_window': hours_total}
+    common = dict(check_id='under_replicated', metric_name='UnderReplicatedPartitions', category=Category.RELIABILITY,
+                  source='best_practices', chart='UnderReplicatedPartitions', threshold=0.0, threshold_text='0')
+    if not affected:
+        return [_finding(severity=Severity.HEALTHY, title='No under-replicated partitions',
+                         description='UnderReplicatedPartitions was 0 on every broker throughout the window.',
+                         value=0.0, evidence=ev, observed='0', **common)]
+    share = (worst_hours / hours_total * 100.0) if hours_total else 0.0
+    peak = max(peaks.values())
+    if current or share >= 5.0:
+        sev, title = Severity.WARNING, 'Under-replicated partitions persist'
+        conf = 'high'
     else:
-        findings.append(Finding(
-            metric_name='OfflinePartitionsCount',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='No Offline Partitions',
-            description='All partitions are online and available.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
+        sev, title = Severity.INFORMATIONAL, 'Brief under-replication episodes'
+        conf = 'medium'
+    desc = (f'Up to {peak:.0f} under-replicated partition(s) on broker(s) {", ".join(affected)}, present in '
+            f'{worst_hours} of {hours_total} hours ({share:.0f}%). ')
+    desc += ('Under-replication is still present in the latest hour. ' if current else '')
+    desc += ('Short episodes are expected during broker restarts and rolling updates; sustained under-replication '
+             'means a follower cannot keep up (network, disk, or CPU pressure on the follower broker).')
+    return [_finding(severity=sev, title=title, description=desc, value=peak, evidence=ev, brokers=affected,
+                     observed=f'peak {peak:.0f}, {share:.0f}% of hours', confidence=conf, **common)]
 
 
-def analyze_disk_usage(metric: MetricData, cluster_info: ClusterInfo) -> List[Finding]:
-    """Analyze disk usage (STANDARD only - Express has serverless storage)."""
-    findings = []
-    
-    # Skip for EXPRESS clusters
-    if cluster_info.cluster_type == 'EXPRESS':
-        return findings
-    
-    max_val = metric.statistics['max']
-    avg_val = metric.statistics['avg']
-    
-    # Calculate storage growth rate if we have time series data
-    growth_rate_per_day = None
-    days_until_full = None
-    
-    if len(metric.values) > 1 and len(metric.timestamps) > 1:
-        # Calculate linear growth rate
-        first_val = metric.values[0]
-        last_val = metric.values[-1]
-        time_diff_days = (metric.timestamps[-1] - metric.timestamps[0]).total_seconds() / 86400
-        
-        if time_diff_days > 0 and last_val > first_val:
-            growth_rate_per_day = (last_val - first_val) / time_diff_days
-            
-            # Project days until 80% full
-            if growth_rate_per_day > 0 and last_val < 80:
-                days_until_full = (80 - last_val) / growth_rate_per_day
-    
-    if max_val >= 80.0:
-        findings.append(Finding(
-            metric_name='KafkaDataLogsDiskUsed',
-            severity=Severity.CRITICAL,
-            category=Category.RELIABILITY,
-            title='High Disk Usage',
-            description=f'Disk usage reached {max_val:.1f}%, exceeding 80% threshold. Risk of broker failures.',
-            current_value=max_val,
-            threshold_value=80.0,
-            evidence={'statistics': metric.statistics, 'growth_rate_per_day': growth_rate_per_day}
-        ))
-    elif max_val >= 70.0:
-        desc = f'Disk usage at {max_val:.1f}%. Consider increasing storage capacity.'
-        if days_until_full and days_until_full < 30:
-            desc += f' Projected to reach 80% in ~{int(days_until_full)} days at current growth rate.'
-        
-        findings.append(Finding(
-            metric_name='KafkaDataLogsDiskUsed',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Elevated Disk Usage',
-            description=desc,
-            current_value=max_val,
-            threshold_value=80.0,
-            evidence={'statistics': metric.statistics, 'growth_rate_per_day': growth_rate_per_day, 'days_until_full': days_until_full}
-        ))
-    else:
-        desc = f'Disk usage at {max_val:.1f}%, well below 80% threshold.'
-        if days_until_full and days_until_full < 90:
-            desc += f' Projected to reach 80% in ~{int(days_until_full)} days at current growth rate.'
-        
-        findings.append(Finding(
-            metric_name='KafkaDataLogsDiskUsed',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='Disk Usage Normal',
-            description=desc,
-            current_value=max_val,
-            threshold_value=80.0,
-            evidence={'statistics': metric.statistics, 'growth_rate_per_day': growth_rate_per_day, 'days_until_full': days_until_full}
-        ))
-    
-    return findings
+def analyze_disk_usage(brokers: List[MetricData], cluster_info: ClusterInfo) -> List[Finding]:
+    """KafkaDataLogsDiskUsed per broker (Standard only). Action threshold 85% per AWS guidance."""
+    peaks = {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in brokers}
+    lasts = {m.broker_id: (m.values[-1] if m.values else 0.0) for m in brokers}
+    worst_broker = max(peaks, key=peaks.get)
+    worst_metric = next(m for m in brokers if m.broker_id == worst_broker)
+    growth = _linear_growth_per_day(worst_metric)
+    days_to_action = None
+    if growth and growth > 0 and lasts[worst_broker] < ref.DISK_ACTION_PCT:
+        days_to_action = (ref.DISK_ACTION_PCT - lasts[worst_broker]) / growth
+    ev = {'peak_per_broker': peaks, 'current_per_broker': lasts, 'growth_pct_per_day': growth,
+          'days_until_85pct': days_to_action, 'volume_gib': cluster_info.ebs_volume_size}
+    proj = ''
+    if days_to_action is not None and days_to_action < 90:
+        proj = f' At the observed growth of {growth:.2f} percentage points per day, broker {worst_broker} reaches 85% in about {days_to_action:.0f} days.'
+    common = dict(check_id='disk_usage', metric_name='KafkaDataLogsDiskUsed', category=Category.RELIABILITY,
+                  source='best_practices', chart='KafkaDataLogsDiskUsed', threshold=ref.DISK_ACTION_PCT,
+                  threshold_text=f'action at {ref.DISK_ACTION_PCT:.0f}%, warning at {ref.DISK_WARNING_PCT:.0f}%')
+    peak = peaks[worst_broker]
+    over = [b for b, v in peaks.items() if v >= ref.DISK_ACTION_PCT]
+    warn = [b for b, v in peaks.items() if ref.DISK_WARNING_PCT <= v < ref.DISK_ACTION_PCT]
+    if over:
+        return [_finding(severity=Severity.CRITICAL, title='Data log disk usage reached the action threshold',
+                         description=(f'Disk usage peaked at {peak:.1f}% on broker {worst_broker} (brokers at or above '
+                                      f'85%: {", ".join(over)}). A full data volume stops the broker and can take '
+                                      f'partitions offline.{proj}'),
+                         value=peak, evidence=ev, brokers=over, observed=f'peak {peak:.1f}%', **common)]
+    if warn:
+        return [_finding(severity=Severity.WARNING, title='Data log disk usage approaching the action threshold',
+                         description=(f'Disk usage peaked at {peak:.1f}% on broker {worst_broker}. AWS recommends acting '
+                                      f'at 85%.{proj}'),
+                         value=peak, evidence=ev, brokers=warn, observed=f'peak {peak:.1f}%', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Data log disk usage within limits',
+                     description=(f'Highest disk usage was {peak:.1f}% (broker {worst_broker}); the 85% action '
+                                  f'threshold was not approached.{proj}'),
+                     value=peak, evidence=ev, observed=f'peak {peak:.1f}%', **common)]
 
 
-def analyze_leader_count(metric: MetricData, cluster_info: ClusterInfo) -> List[Finding]:
-    """Check if leaders are balanced across brokers."""
-    findings = []
-    avg_val = metric.statistics['avg']
-    
-    findings.append(Finding(
-        metric_name='LeaderCount',
-        severity=Severity.INFORMATIONAL,
-        category=Category.PERFORMANCE,
-        title='Leader Distribution',
-        description=f'Average leader count per broker: {avg_val:.1f}. Leaders should be balanced across brokers for optimal performance.',
-        current_value=avg_val,
-        threshold_value=None,
-        evidence={'statistics': metric.statistics}
-    ))
-    
-    return findings
+def analyze_availability_zones(cluster_info: ClusterInfo, workload: str) -> List[Finding]:
+    az = cluster_info.availability_zones
+    common = dict(check_id='availability_zones', metric_name='AvailabilityZones', category=Category.RELIABILITY,
+                  source='best_practices', section='configuration', threshold=3.0, threshold_text='3 AZs')
+    if az <= 0:
+        return [not_assessed('availability_zones', 'AvailabilityZones', Category.RELIABILITY, 'Availability zones',
+                             'The cluster description did not include client subnets.', section='configuration')]
+    ev = {'az_count': az, 'client_subnets': cluster_info.client_subnets}
+    if az == 1:
+        return [_finding(severity=Severity.CRITICAL, title='Single availability zone',
+                         description='All brokers are in one AZ; an AZ event takes the whole cluster offline.',
+                         value=float(az), evidence=ev, observed='1 AZ', **common)]
+    if az == 2:
+        sev = Severity.WARNING if workload == 'production' else Severity.INFORMATIONAL
+        return [_finding(severity=sev, title='Two availability zones',
+                         description=('Brokers span 2 AZs. AWS recommends 3 AZs for production so that the loss of '
+                                      'one AZ leaves a majority of replicas available; with 2 AZs and replication '
+                                      'factor 3, an AZ failure can leave partitions with a single in-sync replica.'),
+                         value=float(az), evidence=ev, observed='2 AZs', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Three availability zones',
+                     description=f'Brokers span {az} AZs, matching the AWS recommendation.',
+                     value=float(az), evidence=ev, observed=f'{az} AZs', **common)]
 
 
-def analyze_broker_partition_count(metric: MetricData, cluster_info: ClusterInfo) -> List[Finding]:
-    """Analyze partition count per broker."""
-    findings = []
-    avg_val = metric.statistics['avg']
-    max_val = metric.statistics['max']
-    
-    findings.append(Finding(
-        metric_name='PartitionCount',
-        severity=Severity.INFORMATIONAL,
-        category=Category.PERFORMANCE,
-        title='Partition Count Per Broker',
-        description=f'Average partitions per broker: {avg_val:.1f}, Max: {max_val:.1f}. Includes replicas.',
-        current_value=avg_val,
-        threshold_value=None,
-        evidence={'statistics': metric.statistics}
-    ))
-    
-    return findings
+def analyze_storage_auto_scaling(cluster_info: ClusterInfo, workload: str) -> List[Finding]:
+    if cluster_info.is_express:
+        return []
+    common = dict(check_id='storage_autoscaling', metric_name='StorageAutoScaling', category=Category.RELIABILITY,
+                  source='storage_autoscaling', section='configuration')
+    if cluster_info.storage_autoscaling is None:
+        return [not_assessed('storage_autoscaling', 'StorageAutoScaling', Category.RELIABILITY,
+                             'Storage auto scaling', cluster_info.storage_autoscaling_detail,
+                             section='configuration', source='storage_autoscaling')]
+    ev = {'enabled': cluster_info.storage_autoscaling, 'detail': cluster_info.storage_autoscaling_detail,
+          'target_pct': cluster_info.storage_autoscaling_target_pct}
+    if cluster_info.storage_autoscaling:
+        return [_finding(severity=Severity.HEALTHY, title='Storage auto scaling enabled',
+                         description=f'Application Auto Scaling manages broker storage: {cluster_info.storage_autoscaling_detail}.',
+                         value=1.0, evidence=ev, observed='enabled', **common)]
+    sev = Severity.WARNING if workload == 'production' else Severity.INFORMATIONAL
+    return [_finding(severity=sev, title='Storage auto scaling not configured',
+                     description=(f'{cluster_info.storage_autoscaling_detail}. Without a scaling policy, disk growth '
+                                  'requires a manual storage update; a full volume stops the broker.'),
+                     value=0.0, evidence=ev, observed='disabled', **common)]
 
 
-def analyze_cpu_total(cpu_user_list: List[MetricData], cpu_system_list: List[MetricData]) -> List[Finding]:
-    """
-    Analyze total CPU usage (User + System) per broker.
-    Best practice: Total CPU should stay below 60%.
-    - CRITICAL if P95 >= 60% (sustained high usage)
-    - Ignores imbalance if all brokers have low CPU usage (<30%)
-    """
-    findings = []
-    
-    # Calculate total CPU for all brokers
-    broker_cpu_data = []
-    for cpu_user in cpu_user_list:
-        broker_id = cpu_user.broker_id
-        cpu_system = next((m for m in cpu_system_list if m.broker_id == broker_id), None)
-        
-        if not cpu_system:
+# --------------------------------------------------------------------------- performance checks
+
+def cpu_total_series(cpu_user: List[MetricData], cpu_system: List[MetricData]) -> Dict[str, Dict[str, Any]]:
+    """Per broker: CpuUser + CpuSystem summed point-wise on common timestamps."""
+    result: Dict[str, Dict[str, Any]] = {}
+    system_by_broker = {m.broker_id: m for m in cpu_system}
+    for user in cpu_user:
+        system = system_by_broker.get(user.broker_id)
+        if not system:
             continue
-        
-        # Calculate total CPU for this broker
-        avg_total = cpu_user.statistics['avg'] + cpu_system.statistics['avg']
-        max_total = cpu_user.statistics['max'] + cpu_system.statistics['max']
-        p95_total = cpu_user.statistics['p95'] + cpu_system.statistics['p95']
-        
-        broker_cpu_data.append({
-            'broker_id': broker_id,
-            'avg_total': avg_total,
-            'max_total': max_total,
-            'p95_total': p95_total,
-            'cpu_user_avg': cpu_user.statistics['avg'],
-            'cpu_system_avg': cpu_system.statistics['avg']
-        })
-    
-    # Check for sustained high CPU usage (P95 >= 60%)
-    high_cpu_brokers = [b for b in broker_cpu_data if b['p95_total'] >= 60.0]
-    
-    for broker in high_cpu_brokers:
-        findings.append(Finding(
-            metric_name='CpuTotal',
-            severity=Severity.CRITICAL,
-            category=Category.PERFORMANCE,
-            title=f'High CPU Usage - Broker {broker["broker_id"]}',
-            description=f'Total CPU (User+System) P95 at {broker["p95_total"]:.1f}%, exceeding 60% threshold. Avg: {broker["avg_total"]:.1f}%, Max: {broker["max_total"]:.1f}%',
-            current_value=broker['p95_total'],
-            threshold_value=60.0,
-            evidence=broker
-        ))
-    
-    # If no critical findings, create a healthy summary
-    if not findings and broker_cpu_data:
-        cluster_avg_total = np.mean([b['avg_total'] for b in broker_cpu_data])
-        cluster_max_p95 = max([b['p95_total'] for b in broker_cpu_data])
-        
-        findings.append(Finding(
-            metric_name='CpuTotal',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='CPU Usage Normal',
-            description=f'Total CPU usage (User+System) below 60% threshold. Cluster average: {cluster_avg_total:.1f}%, Max P95: {cluster_max_p95:.1f}%',
-            current_value=cluster_avg_total,
-            threshold_value=60.0,
-            evidence={'cluster_avg_total': cluster_avg_total, 'cluster_max_p95': cluster_max_p95}
-        ))
-    
-    return findings
+        timestamps, vu, vs = align_series(user, system)
+        totals = [a + b for a, b in zip(vu, vs)]
+        if not totals:
+            continue
+        stats = summarize(totals)
+        peak_u = user.series.get('Maximum'); peak_s = system.series.get('Maximum')
+        stats['peak'] = (max(peak_u) + max(peak_s)) if peak_u and peak_s else stats['max']
+        result[str(user.broker_id)] = {'timestamps': timestamps, 'values': totals, 'stats': stats}
+    return result
 
 
-def analyze_cpu_usage(cpu_user: MetricData, cpu_system: MetricData) -> List[Finding]:
-    """Combined should be < 60% sustained."""
-    findings = []
-    
-    # Calculate combined CPU
-    combined_avg = cpu_user.statistics['avg'] + cpu_system.statistics['avg']
-    combined_p95 = cpu_user.statistics['p95'] + cpu_system.statistics['p95']
-    
-    if combined_p95 >= 60.0:
-        findings.append(Finding(
-            metric_name='CpuUsage',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='High CPU Usage',
-            description=f'Combined CPU usage (P95) at {combined_p95:.1f}%, exceeding 60% threshold.',
-            current_value=combined_p95,
-            threshold_value=60.0,
-            evidence={
-                'cpu_user_stats': cpu_user.statistics,
-                'cpu_system_stats': cpu_system.statistics,
-                'combined_avg': combined_avg
-            }
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='CpuUsage',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='CPU Usage Normal',
-            description=f'Combined CPU usage (P95) at {combined_p95:.1f}%, below 60% threshold.',
-            current_value=combined_p95,
-            threshold_value=60.0,
-            evidence={
-                'cpu_user_stats': cpu_user.statistics,
-                'cpu_system_stats': cpu_system.statistics,
-                'combined_avg': combined_avg
-            }
-        ))
-    
-    return findings
+def analyze_cpu_total(cpu_user: List[MetricData], cpu_system: List[MetricData]) -> List[Finding]:
+    """CPU User + CPU System must stay under 60% (AWS best practice). Series are aligned by
+    timestamp before summing, so percentiles describe the real combined load."""
+    per_broker = cpu_total_series(cpu_user, cpu_system)
+    if not per_broker:
+        return [not_assessed('cpu_total', 'CpuTotal', Category.PERFORMANCE, 'CPU utilisation',
+                             'CpuUser and CpuSystem series had no common timestamps.', section='derived')]
+    limit = ref.CPU_TOTAL_MAX_PCT
+    p95 = {b: d['stats']['p95'] for b, d in per_broker.items()}
+    avg = {b: d['stats']['avg'] for b, d in per_broker.items()}
+    hours_over = {b: sum(1 for v in d['values'] if v >= limit) for b, d in per_broker.items()}
+    sustained = [b for b, v in p95.items() if v >= limit]
+    episodic = [b for b, h in hours_over.items() if h > 0 and b not in sustained]
+    worst = max(p95, key=p95.get)
+    ev = {'p95_per_broker': p95, 'avg_per_broker': avg, 'hours_at_or_above_60_per_broker': hours_over,
+          'peak_per_broker': {b: d['stats']['peak'] for b, d in per_broker.items()}}
+    common = dict(check_id='cpu_total', metric_name='CpuTotal', category=Category.PERFORMANCE, source='best_practices',
+                  chart='CpuTotal', section='derived', threshold=limit, threshold_text=f'< {limit:.0f}% (User + System)')
+    if sustained:
+        return [_finding(severity=Severity.CRITICAL, title='Sustained CPU utilisation above 60%',
+                         description=(f'P95 of hourly CPU (User + System) is {p95[worst]:.1f}% on broker {worst}; brokers '
+                                      f'above the limit: {", ".join(sustained)}. Below 40% headroom, Kafka cannot absorb '
+                                      'the extra load of a broker restart, patching or a leadership move without latency '
+                                      'impact. AWS recommends moving to the next broker size, or adding brokers when '
+                                      'topics are written round-robin.'),
+                         value=p95[worst], evidence=ev, brokers=sustained, observed=f'P95 {p95[worst]:.1f}%', **common)]
+    if episodic:
+        hours = max(hours_over.values())
+        return [_finding(severity=Severity.WARNING, title='CPU utilisation exceeded 60% in some hours',
+                         description=(f'Hourly CPU (User + System) reached or exceeded 60% in up to {hours} hour(s) on '
+                                      f'broker(s) {", ".join(episodic)}; P95 stays at {p95[worst]:.1f}%. Identify whether '
+                                      'the peaks follow a batch schedule or a rebalance; if they grow, plan a size change.'),
+                         value=p95[worst], evidence=ev, brokers=episodic, observed=f'P95 {p95[worst]:.1f}%, {hours} h >= 60%',
+                         confidence='medium', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='CPU utilisation within the recommended limit',
+                     description=(f'Highest P95 of hourly CPU (User + System) is {p95[worst]:.1f}% (broker {worst}); '
+                                  f'cluster average {np.mean(list(avg.values())):.1f}%.'),
+                     value=p95[worst], evidence=ev, observed=f'P95 {p95[worst]:.1f}%', **common)]
 
 
-def analyze_memory_usage(memory_used: MetricData, memory_free: MetricData) -> List[Finding]:
-    """Utilization should be < 85%."""
-    findings = []
-    
-    # Calculate memory utilization percentage
-    total_memory = memory_used.statistics['avg'] + memory_free.statistics['avg']
-    if total_memory > 0:
-        utilization = (memory_used.statistics['avg'] / total_memory) * 100
-        max_utilization = (memory_used.statistics['max'] / total_memory) * 100
-        
-        if max_utilization >= 85.0:
-            findings.append(Finding(
-                metric_name='MemoryUsage',
-                severity=Severity.WARNING,
-                category=Category.PERFORMANCE,
-                title='High Memory Usage',
-                description=f'Memory utilization reached {max_utilization:.1f}%, exceeding 85% threshold.',
-                current_value=max_utilization,
-                threshold_value=85.0,
-                evidence={
-                    'memory_used_stats': memory_used.statistics,
-                    'memory_free_stats': memory_free.statistics,
-                    'avg_utilization': utilization
-                }
-            ))
-    
-    return findings
+def analyze_heap_memory(brokers: List[MetricData]) -> List[Finding]:
+    """HeapMemoryAfterGC should stay under 60% (AWS best practice)."""
+    limit = ref.HEAP_AFTER_GC_MAX_PCT
+    p95 = {m.broker_id: m.statistics['p95'] for m in brokers}
+    hours_over = {m.broker_id: sum(1 for v in m.values if v >= limit) for m in brokers}
+    worst = max(p95, key=p95.get)
+    sustained = [b for b, v in p95.items() if v >= limit]
+    episodic = [b for b, h in hours_over.items() if h > 0 and b not in sustained]
+    ev = {'p95_per_broker': p95, 'hours_at_or_above_60_per_broker': hours_over,
+          'peak_per_broker': {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in brokers}}
+    common = dict(check_id='heap_after_gc', metric_name='HeapMemoryAfterGC', category=Category.PERFORMANCE,
+                  source='best_practices', chart='HeapMemoryAfterGC', threshold=limit, threshold_text=f'< {limit:.0f}%')
+    if sustained:
+        return [_finding(severity=Severity.CRITICAL, title='Heap memory after GC stays above 60%',
+                         description=(f'P95 of HeapMemoryAfterGC is {p95[worst]:.1f}% on broker {worst} (brokers above the '
+                                      f'limit: {", ".join(sustained)}). Heap that stays full after collection means '
+                                      'the JVM is close to its limit: expect long GC pauses and, ultimately, broker '
+                                      'restarts. Larger brokers add heap; reducing transactional.id.expiration.ms or '
+                                      'the number of partitions per broker reduces demand.'),
+                         value=p95[worst], evidence=ev, brokers=sustained, observed=f'P95 {p95[worst]:.1f}%', **common)]
+    if episodic:
+        return [_finding(severity=Severity.WARNING, title='Heap memory after GC exceeded 60% in some hours',
+                         description=(f'HeapMemoryAfterGC reached 60% in up to {max(hours_over.values())} hour(s) on '
+                                      f'broker(s) {", ".join(episodic)}; P95 is {p95[worst]:.1f}%.'),
+                         value=p95[worst], evidence=ev, brokers=episodic, observed=f'P95 {p95[worst]:.1f}%',
+                         confidence='medium', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Heap memory after GC within the recommended limit',
+                     description=f'Highest P95 of HeapMemoryAfterGC is {p95[worst]:.1f}% (broker {worst}).',
+                     value=p95[worst], evidence=ev, observed=f'P95 {p95[worst]:.1f}%', **common)]
 
 
-def analyze_heap_memory(metric: MetricData) -> List[Finding]:
-    """After GC should be < 60%."""
-    findings = []
-    max_val = metric.statistics['max']
-    
-    if max_val >= 60.0:
-        findings.append(Finding(
-            metric_name='HeapMemoryAfterGC',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='High Heap Memory After GC',
-            description=f'Heap memory after GC at {max_val:.1f}%, exceeding 60% threshold. Indicates memory pressure.',
-            current_value=max_val,
-            threshold_value=60.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
-
-
-def analyze_under_min_isr(metric: MetricData) -> List[Finding]:
-    """Should be 0. CRITICAL if current > 0, WARNING if historical > 0."""
-    findings = []
-    max_val = metric.statistics['max']
-    current_val = metric.values[-1] if metric.values else 0  # Most recent value
-    
-    if current_val > 0:
-        findings.append(Finding(
-            metric_name='UnderMinIsrPartitionCount',
-            severity=Severity.CRITICAL,
-            category=Category.RELIABILITY,
-            title='Partitions Under Min ISR Now',
-            description=f'Currently {int(current_val)} partitions under minimum ISR. Immediate risk of data loss.',
-            current_value=current_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics, 'current': current_val}
-        ))
-    elif max_val > 0:
-        findings.append(Finding(
-            metric_name='UnderMinIsrPartitionCount',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Partitions Under Min ISR (Historical)',
-            description=f'Detected up to {int(max_val)} partitions under minimum ISR in last 30 days. Monitor replication health.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='UnderMinIsrPartitionCount',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='All Partitions Meet Min ISR',
-            description='All partitions meet minimum in-sync replica requirements.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
-
-
-def analyze_under_replicated_partitions(metric: MetricData) -> List[Finding]:
-    """Should be 0."""
-    findings = []
-    max_val = metric.statistics['max']
-    
-    if max_val > 0:
-        findings.append(Finding(
-            metric_name='UnderReplicatedPartitions',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Under-Replicated Partitions Detected',
-            description=f'Detected up to {int(max_val)} under-replicated partitions. Replication is lagging.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='UnderReplicatedPartitions',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='All Partitions Fully Replicated',
-            description='All partitions are fully replicated.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
-
-
-def analyze_throughput(
-    bytes_in: Optional[MetricData],
-    bytes_out: Optional[MetricData],
-    cluster_info: ClusterInfo
-) -> List[Finding]:
-    """
-    Analyze cluster throughput patterns and check against network limits.
-    
-    Network limits based on EC2 instance specifications.
-    Data from: msk-limits-hardware-bottleneck.png
-    """
-    findings = []
-    
-    # Network bandwidth limits based on AWS MSK documentation
-    # Standard: Based on EC2 instance network performance
-    # Express: Based on AWS MSK Express throttle limits (Maximum quota)
-    # Format: instance_type: (ingress_mb_per_sec, egress_mb_per_sec)
-    network_limits = {
-        # M5 Standard instances
-        'kafka.m5.large': (9, 9),
-        'kafka.m5.xlarge': (16, 16),
-        'kafka.m5.2xlarge': (31, 31),
-        'kafka.m5.4xlarge': (63, 63),
-        'kafka.m5.8xlarge': (106, 106),
-        'kafka.m5.12xlarge': (125, 125),
-        'kafka.m5.16xlarge': (125, 125),
-        'kafka.m5.24xlarge': (125, 125),
-        # M7g Standard instances (Graviton3)
-        'kafka.m7g.large': (10, 10),
-        'kafka.m7g.xlarge': (20, 20),
-        'kafka.m7g.2xlarge': (39, 39),
-        'kafka.m7g.4xlarge': (78, 78),
-        'kafka.m7g.8xlarge': (125, 125),
-        'kafka.m7g.12xlarge': (125, 125),
-        'kafka.m7g.16xlarge': (125, 125),
-        # M7g Express instances (Maximum quota from AWS docs)
-        'express.m7g.large': (23.4, 58.5),
-        'express.m7g.xlarge': (46.8, 117),
-        'express.m7g.2xlarge': (93.7, 234.2),
-        'express.m7g.4xlarge': (187.5, 468.7),
-        'express.m7g.8xlarge': (375, 937.5),
-        'express.m7g.12xlarge': (562.5, 1406.2),
-        'express.m7g.16xlarge': (750, 1875),
-    }
-    
-    ingress_limit_mb, egress_limit_mb = network_limits.get(cluster_info.instance_type, (10, 10))
-    ingress_limit_bytes = ingress_limit_mb * 1024 * 1024  # Convert MB/s to bytes/s
-    egress_limit_bytes = egress_limit_mb * 1024 * 1024
-    threshold_70_ingress = ingress_limit_bytes * 0.7
-    threshold_70_egress = egress_limit_bytes * 0.7
-    
-    if bytes_in:
-        max_in_bytes = bytes_in.statistics['max']
-        avg_in_bytes = bytes_in.statistics['avg']
-        avg_in_mb = avg_in_bytes / (1024 * 1024)
-        max_in_mb = max_in_bytes / (1024 * 1024)
-        utilization_in = (max_in_bytes / ingress_limit_bytes) * 100
-        
-        if max_in_bytes >= threshold_70_ingress:
-            findings.append(Finding(
-                metric_name='BytesInPerSec',
-                severity=Severity.WARNING,
-                category=Category.PERFORMANCE,
-                title='High Inbound Network Utilization',
-                description=f'Peak inbound throughput at {utilization_in:.1f}% of network capacity ({max_in_mb:.1f} MB/s / {ingress_limit_mb} MB/s). Consider upgrading instance type to avoid throttling.',
-                current_value=max_in_mb,
-                threshold_value=float(ingress_limit_mb),
-                evidence={'max_mb_per_sec': max_in_mb, 'avg_mb_per_sec': avg_in_mb, 'limit_mb_per_sec': ingress_limit_mb, 'utilization_pct': utilization_in}
-            ))
+def analyze_throughput(bytes_in: List[MetricData], bytes_out: List[MetricData], cluster_info: ClusterInfo) -> List[Finding]:
+    """Per-broker BytesIn/BytesOut against the broker size limits. Express limits are published
+    (sustained and throttle quota); Standard values are tool guidelines."""
+    limits = ref.get_instance_limits(cluster_info.instance_type)
+    findings: List[Finding] = []
+    for direction, metrics, sustained, maximum in (
+        ('in', bytes_in, limits.ingress_sustained_mbps if limits else None, limits.ingress_max_mbps if limits else None),
+        ('out', bytes_out, limits.egress_sustained_mbps if limits else None, limits.egress_max_mbps if limits else None),
+    ):
+        metric_name = 'BytesInPerSec' if direction == 'in' else 'BytesOutPerSec'
+        check_id = f'throughput_{direction}'
+        label = 'Inbound' if direction == 'in' else 'Outbound'
+        if not metrics:
+            continue
+        if not limits or sustained is None:
+            findings.append(not_assessed(check_id, metric_name, Category.PERFORMANCE, f'{label} throughput vs broker size',
+                                         f'Broker size {cluster_info.instance_type} is not in the limits catalog.',
+                                         source='quotas'))
+            continue
+        mb = 1024 * 1024
+        p95 = {m.broker_id: m.statistics['p95'] / mb for m in metrics}
+        peak = {m.broker_id: m.statistics.get('peak', m.statistics['max']) / mb for m in metrics}
+        avg = {m.broker_id: m.statistics['avg'] / mb for m in metrics}
+        worst = max(p95, key=p95.get)
+        total_avg = sum(avg.values())
+        conf = 'high' if limits.throughput_confidence == 'official' else 'low'
+        basis = ('published sustained limit' if limits.throughput_confidence == 'official'
+                 else 'tool guideline (no published per-broker quota for Standard brokers)')
+        ev = {'p95_mbps_per_broker': p95, 'peak_mbps_per_broker': peak, 'avg_mbps_per_broker': avg,
+              'sustained_limit_mbps': sustained, 'max_quota_mbps': maximum, 'cluster_avg_mbps': total_avg,
+              'limit_basis': basis}
+        common = dict(check_id=check_id, metric_name=metric_name, category=Category.PERFORMANCE,
+                      source='quotas' if conf == 'high' else 'best_practices', chart=metric_name,
+                      threshold=sustained, confidence=conf,
+                      threshold_text=f'{sustained:g} MB/s sustained' + (f', throttle at {maximum:g} MB/s' if maximum else ''))
+        over_sustained = [b for b, v in p95.items() if v >= sustained]
+        near_quota = [b for b, v in peak.items() if maximum and v >= maximum * ref.THROUGHPUT_MAX_WARNING_RATIO]
+        if near_quota:
+            findings.append(_finding(severity=Severity.CRITICAL, title=f'{label} throughput close to the throttle quota',
+                                     description=(f'Peak {label.lower()} throughput reached {max(peak.values()):.1f} MB/s on '
+                                                  f'broker(s) {", ".join(near_quota)}, within 10% of the {maximum:g} MB/s '
+                                                  'quota at which MSK throttles client traffic. Add brokers or move to a '
+                                                  'larger size before clients see throttling.'),
+                                     value=max(peak.values()), evidence=ev, brokers=near_quota,
+                                     observed=f'peak {max(peak.values()):.1f} MB/s', **common))
+        elif over_sustained:
+            findings.append(_finding(severity=Severity.WARNING, title=f'{label} throughput above the sustained limit',
+                                     description=(f'P95 {label.lower()} throughput is {p95[worst]:.1f} MB/s on broker {worst} '
+                                                  f'(brokers above {sustained:g} MB/s: {", ".join(over_sustained)}). Above '
+                                                  f'the {basis}, latency degrades before throttling starts.'),
+                                     value=p95[worst], evidence=ev, brokers=over_sustained,
+                                     observed=f'P95 {p95[worst]:.1f} MB/s', **common))
         else:
-            findings.append(Finding(
-                metric_name='BytesInPerSec',
-                severity=Severity.HEALTHY,
-                category=Category.PERFORMANCE,
-                title='Inbound Throughput OK',
-                description=f'Inbound throughput: Avg {avg_in_mb:.2f} MB/s, Peak {max_in_mb:.2f} MB/s ({utilization_in:.1f}% of {ingress_limit_mb} MB/s capacity)',
-                current_value=avg_in_mb,
-                threshold_value=None,
-                evidence={'max_mb_per_sec': max_in_mb, 'avg_mb_per_sec': avg_in_mb, 'limit_mb_per_sec': ingress_limit_mb}
-            ))
-    
-    if bytes_out:
-        max_out_bytes = bytes_out.statistics['max']
-        avg_out_bytes = bytes_out.statistics['avg']
-        avg_out_mb = avg_out_bytes / (1024 * 1024)
-        max_out_mb = max_out_bytes / (1024 * 1024)
-        utilization_out = (max_out_bytes / egress_limit_bytes) * 100
-        
-        if max_out_bytes >= threshold_70_egress:
-            findings.append(Finding(
-                metric_name='BytesOutPerSec',
-                severity=Severity.WARNING,
-                category=Category.PERFORMANCE,
-                title='High Outbound Network Utilization',
-                description=f'Peak outbound throughput at {utilization_out:.1f}% of network capacity ({max_out_mb:.1f} MB/s / {egress_limit_mb} MB/s). Consider upgrading instance type to avoid throttling.',
-                current_value=max_out_mb,
-                threshold_value=float(egress_limit_mb),
-                evidence={'max_mb_per_sec': max_out_mb, 'avg_mb_per_sec': avg_out_mb, 'limit_mb_per_sec': egress_limit_mb, 'utilization_pct': utilization_out}
-            ))
-        else:
-            findings.append(Finding(
-                metric_name='BytesOutPerSec',
-                severity=Severity.HEALTHY,
-                category=Category.PERFORMANCE,
-                title='Outbound Throughput OK',
-                description=f'Outbound throughput: Avg {avg_out_mb:.2f} MB/s, Peak {max_out_mb:.2f} MB/s ({utilization_out:.1f}% of {egress_limit_mb} MB/s capacity)',
-                current_value=avg_out_mb,
-                threshold_value=None,
-                evidence={'max_mb_per_sec': max_out_mb, 'avg_mb_per_sec': avg_out_mb, 'limit_mb_per_sec': egress_limit_mb}
-            ))
-    
+            findings.append(_finding(severity=Severity.HEALTHY, title=f'{label} throughput within the broker size limit',
+                                     description=(f'Highest P95 {label.lower()} throughput is {p95[worst]:.1f} MB/s (broker '
+                                                  f'{worst}), {p95[worst] / sustained * 100:.0f}% of the {basis}; cluster '
+                                                  f'average {total_avg:.2f} MB/s.'),
+                                     value=p95[worst], evidence=ev, observed=f'P95 {p95[worst]:.1f} MB/s', **common))
     return findings
 
 
-def analyze_storage_used(metric: MetricData, cluster_info: ClusterInfo) -> List[Finding]:
-    """Analyze storage usage."""
-    findings = []
-    avg_bytes = metric.statistics['avg']
-    max_bytes = metric.statistics['max']
-    avg_gb = avg_bytes / (1024 ** 3)
-    max_gb = max_bytes / (1024 ** 3)
-    
-    findings.append(Finding(
-        metric_name='StorageUsed',
-        severity=Severity.INFORMATIONAL,
-        category=Category.COST,
-        title='Storage Usage',
-        description=f'Average: {avg_gb:.2f} GB, Peak: {max_gb:.2f} GB across {cluster_info.broker_count} brokers',
-        current_value=avg_gb,
-        threshold_value=None,
-        evidence={'statistics': metric.statistics}
-    ))
-    
-    return findings
+def analyze_partition_capacity(brokers: List[MetricData], cluster_info: ClusterInfo,
+                               global_partitions: Optional[MetricData]) -> List[Finding]:
+    """PartitionCount per broker (includes replicas) against the recommended and maximum values."""
+    limits = ref.get_instance_limits(cluster_info.instance_type)
+    current = {m.broker_id: (m.values[-1] if m.values else m.statistics['avg']) for m in brokers}
+    worst = max(current, key=current.get)
+    total_replicas = sum(current.values())
+    global_count = global_partitions.values[-1] if global_partitions and global_partitions.values else None
+    ev = {'current_per_broker': current, 'total_partition_replicas': total_replicas, 'global_partitions': global_count}
+    if not limits:
+        return [not_assessed('partition_capacity', 'PartitionCount', Category.PERFORMANCE, 'Partitions per broker',
+                             f'Broker size {cluster_info.instance_type} is not in the limits catalog.', source='best_practices')]
+    rec, mx = limits.partitions_recommended, limits.partitions_max
+    ev.update({'recommended_per_broker': rec, 'maximum_per_broker': mx})
+    common = dict(check_id='partition_capacity', metric_name='PartitionCount', category=Category.PERFORMANCE,
+                  source='best_practices', chart='PartitionCount', threshold=float(rec),
+                  threshold_text=f'recommended {rec}, maximum {mx} per broker')
+    value = current[worst]
+    over_max = [b for b, v in current.items() if v > mx]
+    over_rec = [b for b, v in current.items() if rec < v <= mx]
+    if over_max:
+        return [_finding(severity=Severity.CRITICAL, title='Partition replicas per broker above the maximum',
+                         description=(f'Broker {worst} hosts {value:.0f} partition replicas; the maximum for '
+                                      f'{cluster_info.instance_type} is {mx}. Above it MSK blocks configuration updates and '
+                                      'size reductions, and metrics can go missing. Add brokers or move to a larger size, '
+                                      'then reassign partitions.'),
+                         value=value, evidence=ev, brokers=over_max, observed=f'{value:.0f} replicas', **common)]
+    if over_rec:
+        return [_finding(severity=Severity.WARNING, title='Partition replicas per broker above the recommended value',
+                         description=(f'Broker {worst} hosts {value:.0f} partition replicas; AWS recommends up to {rec} '
+                                      f'for {cluster_info.instance_type} when traffic spans all partitions (maximum {mx}). '
+                                      'Higher counts are acceptable for low-throughput partitions if validated by testing.'),
+                         value=value, evidence=ev, brokers=over_rec, observed=f'{value:.0f} replicas', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Partition replicas per broker within the recommended value',
+                     description=(f'Most loaded broker ({worst}) hosts {value:.0f} partition replicas, '
+                                  f'{value / rec * 100:.0f}% of the recommended {rec}.' +
+                                  (f' The cluster has {global_count:.0f} partitions (leaders).' if global_count else '')),
+                     value=value, evidence=ev, observed=f'{value:.0f} replicas', **common)]
 
 
-def analyze_rebalance_status(metric: MetricData) -> List[Finding]:
-    """Check if rebalancing is happening frequently."""
-    findings = []
-    max_val = metric.statistics['max']
-    
-    if max_val > 0:
-        findings.append(Finding(
-            metric_name='RebalanceInProgress',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='Consumer Group Rebalancing Detected',
-            description='Consumer group rebalancing detected during the monitoring period. This can impact performance.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
+def analyze_balance(check_id: str, metric_name: str, values: Dict[str, float], unit: str,
+                    cluster_info: ClusterInfo, chart: Optional[str] = None, extra: Optional[Dict[str, Any]] = None,
+                    title_noun: str = '') -> List[Finding]:
+    """Generic per-broker balance check with an activity floor."""
+    threshold = ref.IMBALANCE_THRESHOLDS_PCT.get(metric_name, 20.0)
+    floor = ref.IMBALANCE_MIN_ACTIVITY.get(metric_name, 0.0)
+    res = _imbalance(values, threshold, floor)
+    noun = title_noun or metric_title(metric_name).lower()
+    ev = {'per_broker': values, **res, **(extra or {})}
+    common = dict(check_id=check_id, metric_name=metric_name, category=Category.PERFORMANCE, source='best_practices',
+                  chart=chart or metric_name, section='derived', threshold=threshold,
+                  threshold_text=f'hottest broker within {threshold:g}% of the mean', confidence='medium')
+    if not res.get('relevant'):
+        return [_finding(severity=Severity.HEALTHY, title=f'{noun.capitalize()}: distribution not assessed for imbalance',
+                         description=f'Imbalance not evaluated: {res.get("reason")}.', value=None, evidence=ev,
+                         observed=_fmt(res.get('mean', 0.0), unit) + ' mean', **common)]
+    dev = res['deviation_pct']
+    obs = (f'hottest broker {res["hottest"]} at {_fmt(res["max"], unit)} vs mean {_fmt(res["mean"], unit)} '
+           f'(+{dev:.0f}%)')
+    if res['imbalanced']:
+        hint = ('Rebalance partitions with Cruise Control or kafka-reassign-partitions.sh so that leaders and '
+                'replicas are spread evenly.')
+        if cluster_info.is_express and cluster_info.intelligent_rebalancing_enabled:
+            hint = 'Intelligent rebalancing is active on this Express cluster and should correct the skew over time.'
+        return [_finding(severity=Severity.WARNING, title=f'Uneven {noun} across brokers',
+                         description=(f'Broker {res["hottest"]} carries {_fmt(res["max"], unit)} against a mean of '
+                                      f'{_fmt(res["mean"], unit)} (+{dev:.0f}%, threshold {threshold:g}%); the least loaded '
+                                      f'broker ({res["coldest"]}) has {_fmt(res["min"], unit)}. Uneven {noun} means one '
+                                      f'broker reaches its limits first. {hint}'),
+                         value=dev, evidence=ev, brokers=[res['hottest']], observed=obs, **common)]
+    return [_finding(severity=Severity.HEALTHY, title=f'{noun.capitalize()} balanced across brokers',
+                     description=f'Hottest broker is within {dev:.0f}% of the mean ({_fmt(res["mean"], unit)}).',
+                     value=dev, evidence=ev, observed=obs, **common)]
+
+
+# --------------------------------------------------------------------------- connections
+
+def analyze_client_connections(brokers: List[MetricData], cluster_info: ClusterInfo) -> List[Finding]:
+    """ClientConnectionCount per broker (Sum per minute = broker total). IAM listeners have a
+    published quota of 3000 connections per broker; other listeners have no enforced limit."""
+    limits = ref.get_instance_limits(cluster_info.instance_type)
+    quota = limits.iam_connections_per_broker if limits else 3000
+    iam = 'IAM' in cluster_info.authentication_methods
+    peak = {m.broker_id: (m.breakdown_peak.get('IAM', m.statistics['max']) if iam and m.breakdown_peak
+                          else m.statistics['max']) for m in brokers}
+    avg = {m.broker_id: m.statistics['avg'] for m in brokers}
+    worst = max(peak, key=peak.get)
+    ev = {'peak_per_broker': peak, 'avg_per_broker': avg, 'iam_quota_per_broker': quota,
+          'listener_breakdown_avg': {m.broker_id: m.breakdown for m in brokers if m.breakdown},
+          'estimation': 'broker total = Sum of per-network-processor samples per minute'}
+    common = dict(check_id='client_connections', metric_name='ClientConnectionCount', category=Category.PERFORMANCE,
+                  source='quotas', chart='ClientConnectionCount', threshold=float(quota) if iam else None,
+                  threshold_text=f'{quota} per broker (IAM quota)' if iam else 'no enforced quota (non-IAM listeners)')
+    if not iam:
+        return [_finding(severity=Severity.INFORMATIONAL, title='Client connections (no enforced quota)',
+                         description=(f'Peak client connections per broker: {", ".join(f"{b}: {v:.0f}" for b, v in peak.items())}. '
+                                      'MSK enforces a connection quota only on IAM listeners; keep watching CPU and memory '
+                                      'as connections grow.'),
+                         value=peak[worst], evidence=ev, observed=f'peak {peak[worst]:.0f}', confidence='medium', **common)]
+    ratio = peak[worst] / quota
+    over = [b for b, v in peak.items() if v >= quota]
+    near = [b for b, v in peak.items() if quota * ref.IAM_CONNECTIONS_WARNING_RATIO <= v < quota]
+    if over:
+        return [_finding(severity=Severity.CRITICAL, title='IAM client connections reached the per-broker quota',
+                         description=(f'Broker {worst} peaked at {peak[worst]:.0f} client connections (quota {quota}). '
+                                      'New IAM connections are refused at the quota. Pool connections in clients or raise '
+                                      'listener.name.client_iam.max.connections after assessing broker memory.'),
+                         value=peak[worst], evidence=ev, brokers=over, observed=f'peak {peak[worst]:.0f}', **common)]
+    if near:
+        return [_finding(severity=Severity.WARNING, title='IAM client connections approaching the per-broker quota',
+                         description=(f'Broker {worst} peaked at {peak[worst]:.0f} client connections, {ratio * 100:.0f}% of '
+                                      f'the {quota} quota.'),
+                         value=peak[worst], evidence=ev, brokers=near, observed=f'peak {peak[worst]:.0f}', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Client connections within the IAM quota',
+                     description=f'Highest per-broker peak is {peak[worst]:.0f} connections (broker {worst}), {ratio * 100:.0f}% of the quota.',
+                     value=peak[worst], evidence=ev, observed=f'peak {peak[worst]:.0f}', **common)]
+
+
+def analyze_connection_creation_rate(brokers: List[MetricData], cluster_info: ClusterInfo,
+                                     too_many: Optional[List[MetricData]] = None) -> List[Finding]:
+    """ConnectionCreationRate per broker (new connections per second). IAM quota: 100/s per broker
+    (4/s on kafka.t3.small)."""
+    limits = ref.get_instance_limits(cluster_info.instance_type)
+    quota = limits.iam_connection_rate_per_sec if limits else 100.0
+    iam = 'IAM' in cluster_info.authentication_methods
+    p95 = {m.broker_id: m.statistics['p95'] for m in brokers}
+    peak = {m.broker_id: m.statistics['max'] for m in brokers}
+    avg = {m.broker_id: m.statistics['avg'] for m in brokers}
+    worst = max(p95, key=p95.get)
+    throttled = {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in (too_many or [])}
+    throttled_brokers = [b for b, v in throttled.items() if v > 0]
+    ev = {'p95_per_broker': p95, 'peak_per_broker': peak, 'avg_per_broker': avg, 'iam_quota_per_sec': quota,
+          'iam_too_many_connections_peak': throttled}
+    common = dict(check_id='connection_creation_rate', metric_name='ConnectionCreationRate', category=Category.PERFORMANCE,
+                  source='quotas', chart='ConnectionCreationRate', threshold=quota if iam else None,
+                  threshold_text=f'{quota:g} new connections/s per broker (IAM quota)' if iam else 'no enforced quota')
+    if throttled_brokers:
+        return [_finding(severity=Severity.CRITICAL, title='IAM connection attempts were throttled',
+                         description=(f'IAMTooManyConnections is above 0 on broker(s) {", ".join(throttled_brokers)}: clients '
+                                      f'exceeded the {quota:g} new connections per second quota and were refused. P95 creation '
+                                      f'rate is {p95[worst]:.1f}/s on broker {worst}. Clients that reconnect on every request '
+                                      'or restart in loops are the usual cause; use long-lived producers/consumers and '
+                                      'reconnect.backoff.ms.'),
+                         value=p95[worst], evidence=ev, brokers=throttled_brokers, observed=f'P95 {p95[worst]:.1f}/s', **common)]
+    if not iam:
+        return [_finding(severity=Severity.INFORMATIONAL, title='Connection creation rate (no enforced quota)',
+                         description=(f'P95 new connections per second per broker: '
+                                      f'{", ".join(f"{b}: {v:.1f}" for b, v in p95.items())}. Each new connection costs CPU '
+                                      '(TLS handshake, authentication); a sustained high rate usually points to clients '
+                                      'without connection reuse.'),
+                         value=p95[worst], evidence=ev, observed=f'P95 {p95[worst]:.1f}/s', confidence='medium', **common)]
+    over = [b for b, v in p95.items() if v >= quota]
+    near = [b for b, v in p95.items() if quota * ref.IAM_CONNECTION_RATE_WARNING_RATIO <= v < quota]
+    if over:
+        return [_finding(severity=Severity.CRITICAL, title='Connection creation rate at the IAM quota',
+                         description=(f'P95 of new connections per second is {p95[worst]:.1f} on broker {worst} (quota {quota:g}); '
+                                      f'brokers at or above the quota: {", ".join(over)}. Connections beyond the quota are refused.'),
+                         value=p95[worst], evidence=ev, brokers=over, observed=f'P95 {p95[worst]:.1f}/s', **common)]
+    if near:
+        return [_finding(severity=Severity.WARNING, title='Connection creation rate approaching the IAM quota',
+                         description=(f'P95 of new connections per second is {p95[worst]:.1f} on broker {worst}, '
+                                      f'{p95[worst] / quota * 100:.0f}% of the {quota:g}/s quota (peak {peak[worst]:.1f}/s).'),
+                         value=p95[worst], evidence=ev, brokers=near, observed=f'P95 {p95[worst]:.1f}/s', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Connection creation rate within the IAM quota',
+                     description=f'Highest P95 is {p95[worst]:.1f} new connections/s (broker {worst}), quota {quota:g}/s.',
+                     value=p95[worst], evidence=ev, observed=f'P95 {p95[worst]:.1f}/s', **common)]
+
+
+# --------------------------------------------------------------------------- configuration checks
+
+_VERSION_CACHE: Dict[str, Any] = {}
+
+
+def get_recommended_kafka_version(allow_network: bool = True) -> Dict[str, Any]:
+    """Recommended Kafka version from the AWS documentation page, with provenance.
+
+    Returns {'version': '3.8' | None, 'source': url | None, 'fetched_at': iso | None, 'error': str | None}.
+    """
+    if 'result' in _VERSION_CACHE:
+        return _VERSION_CACHE['result']
+    result: Dict[str, Any] = {'version': None, 'source': None, 'fetched_at': None, 'error': None}
+    url = ref.DOCS['kafka_versions']
+    if not allow_network:
+        result['error'] = 'network lookup disabled'
     else:
-        findings.append(Finding(
-            metric_name='RebalanceInProgress',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='No Rebalancing Activity',
-            description='No consumer group rebalancing detected.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
+        try:
+            request = urllib.request.Request(url, headers={'User-Agent': 'MSK-Health-Check/1.1'})
+            with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310 - fixed https URL
+                html = response.read().decode('utf-8', errors='ignore')
+            match = re.search(r'(\d+\.\d+)(?:\.x|\.\d+)?\s*\(\s*recommended\s*\)', html, re.IGNORECASE)
+            if match:
+                result.update(version=match.group(1), source=url,
+                              fetched_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
+            else:
+                result['error'] = 'recommended version marker not found on the documentation page'
+        except Exception as e:  # network failures are expected in restricted environments
+            result['error'] = f'{type(e).__name__}: {e}'
+    _VERSION_CACHE['result'] = result
+    return result
 
 
-def analyze_under_provisioned(metric: MetricData) -> List[Finding]:
-    """Check if cluster is under-provisioned."""
-    findings = []
-    max_val = metric.statistics['max']
-    
-    if max_val > 0:
-        findings.append(Finding(
-            metric_name='UnderProvisioned',
-            severity=Severity.CRITICAL,
-            category=Category.PERFORMANCE,
-            title='Cluster Under-Provisioned',
-            description='Cluster is under-provisioned. Consider scaling up broker instance types or adding more brokers.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='UnderProvisioned',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='Cluster Properly Provisioned',
-            description='Cluster capacity is adequate for current workload.',
-            current_value=max_val,
-            threshold_value=0.0,
-            evidence={'statistics': metric.statistics}
-        ))
-    
-    return findings
-
-
-def analyze_connection_count(
-    metric: MetricData,
-    cluster_info: ClusterInfo
-) -> List[Finding]:
-    """
-    Analyze client connection count against cluster capacity.
-    ClientConnectionCount is a cluster-level metric (sum across all brokers).
-    Based on AWS MSK documentation:
-    https://docs.aws.amazon.com/msk/latest/developerguide/broker-instance-sizes.html
-    """
-    findings = []
-    
-    # Connection limits per broker based on AWS documentation
-    connection_limits_per_broker = {
-        # T3 instances
-        'kafka.t3.small': 300,
-        
-        # M5 instances
-        'kafka.m5.large': 1000,
-        'kafka.m5.xlarge': 1500,
-        'kafka.m5.2xlarge': 2000,
-        'kafka.m5.4xlarge': 4000,
-        'kafka.m5.8xlarge': 8000,
-        'kafka.m5.12xlarge': 12000,
-        'kafka.m5.16xlarge': 16000,
-        'kafka.m5.24xlarge': 24000,
-        
-        # M7g instances (Graviton3)
-        'kafka.m7g.large': 1000,
-        'kafka.m7g.xlarge': 1500,
-        'kafka.m7g.2xlarge': 2000,
-        'kafka.m7g.4xlarge': 4000,
-        'kafka.m7g.8xlarge': 8000,
-        'kafka.m7g.12xlarge': 12000,
-        'kafka.m7g.16xlarge': 16000,
-    }
-    
-    limit_per_broker = connection_limits_per_broker.get(cluster_info.instance_type, 1000)
-    cluster_limit = limit_per_broker * cluster_info.broker_count
-    max_connections = metric.statistics['max']
-    utilization = (max_connections / cluster_limit) * 100
-    
-    if utilization >= 90.0:
-        findings.append(Finding(
-            metric_name='ClientConnectionCount',
-            severity=Severity.CRITICAL,
-            category=Category.PERFORMANCE,
-            title='Critical Connection Count',
-            description=f'Connection count at {utilization:.1f}% of cluster limit ({int(max_connections)}/{cluster_limit}). Risk of connection exhaustion.',
-            current_value=utilization,
-            threshold_value=80.0,
-            evidence={'max_connections': max_connections, 'cluster_limit': cluster_limit, 'broker_count': cluster_info.broker_count}
-        ))
-    elif utilization >= 80.0:
-        findings.append(Finding(
-            metric_name='ClientConnectionCount',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='High Connection Count',
-            description=f'Connection count at {utilization:.1f}% of cluster limit ({int(max_connections)}/{cluster_limit}). Consider connection pooling.',
-            current_value=utilization,
-            threshold_value=80.0,
-            evidence={'max_connections': max_connections, 'cluster_limit': cluster_limit, 'broker_count': cluster_info.broker_count}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='ClientConnectionCount',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='Connection Count Normal',
-            description=f'Connection count at {utilization:.1f}% of cluster limit ({int(max_connections)}/{cluster_limit}).',
-            current_value=utilization,
-            threshold_value=80.0,
-            evidence={'max_connections': max_connections, 'cluster_limit': cluster_limit, 'broker_count': cluster_info.broker_count}
-        ))
-    
-    return findings
-
-
-def analyze_connection_creation_rate(
-    broker_metrics: List[MetricData],
-    cluster_info: ClusterInfo
-) -> List[Finding]:
-    """
-    Analyze connection creation rate to detect excessive reconnections.
-    
-    High connection creation rates indicate:
-    - Missing connection pooling
-    - Short connection timeouts
-    - Network instability
-    - Client restart loops
-    
-    Reference: AWS MSK Best Practices
-    - IAM auth supports up to 100 new connections/sec per cluster
-    - New connections are expensive (CPU overhead)
-    - Sustained high rates indicate client configuration issues
-    """
-    findings = []
-    
-    if not broker_metrics:
-        return findings
-    
-    # Calculate cluster-wide statistics
-    all_avgs = [m.statistics['avg'] for m in broker_metrics]
-    all_p95s = [m.statistics['p95'] for m in broker_metrics]
-    all_maxs = [m.statistics['max'] for m in broker_metrics]
-    
-    cluster_avg = sum(all_avgs)  # Sum across brokers for cluster-wide rate
-    cluster_p95 = sum(all_p95s)
-    cluster_max = sum(all_maxs)
-    
-    # Thresholds based on AWS documentation and best practices
-    # IAM auth limit: 100 connections/sec per cluster
-    # General recommendation: Keep creation rate low for stable workloads
-    
-    # Check if IAM authentication is enabled (more restrictive limits)
-    is_iam_auth = 'IAM' in cluster_info.authentication_methods
-    
-    if is_iam_auth:
-        critical_threshold = 80.0  # 80% of IAM limit (100/sec)
-        warning_threshold = 50.0   # 50% of IAM limit
-    else:
-        critical_threshold = 50.0  # Arbitrary threshold for non-IAM
-        warning_threshold = 20.0
-    
-    # Analyze P95 (sustained high rate is more concerning than spikes)
-    if cluster_p95 >= critical_threshold:
-        auth_note = ' (approaching IAM auth limit of 100/sec)' if is_iam_auth else ''
-        findings.append(Finding(
-            metric_name='ConnectionCreationRate',
-            severity=Severity.CRITICAL,
-            category=Category.PERFORMANCE,
-            title='Excessive Connection Creation Rate',
-            description=(
-                f'High connection creation rate detected: P95={cluster_p95:.1f} conn/sec, '
-                f'avg={cluster_avg:.1f} conn/sec, max={cluster_max:.1f} conn/sec{auth_note}. '
-                f'This indicates missing connection pooling, short timeouts, or client instability. '
-                f'New connections are expensive and impact CPU performance.'
-            ),
-            current_value=cluster_p95,
-            threshold_value=critical_threshold,
-            evidence={
-                'cluster_avg': cluster_avg,
-                'cluster_p95': cluster_p95,
-                'cluster_max': cluster_max,
-                'broker_count': len(broker_metrics),
-                'iam_auth_enabled': is_iam_auth
-            }
-        ))
-    elif cluster_p95 >= warning_threshold:
-        auth_note = ' (IAM auth limit is 100/sec)' if is_iam_auth else ''
-        findings.append(Finding(
-            metric_name='ConnectionCreationRate',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='Elevated Connection Creation Rate',
-            description=(
-                f'Elevated connection creation rate: P95={cluster_p95:.1f} conn/sec, '
-                f'avg={cluster_avg:.1f} conn/sec, max={cluster_max:.1f} conn/sec{auth_note}. '
-                f'Consider implementing connection pooling and reviewing client timeout configurations.'
-            ),
-            current_value=cluster_p95,
-            threshold_value=warning_threshold,
-            evidence={
-                'cluster_avg': cluster_avg,
-                'cluster_p95': cluster_p95,
-                'cluster_max': cluster_max,
-                'broker_count': len(broker_metrics),
-                'iam_auth_enabled': is_iam_auth
-            }
-        ))
-    elif cluster_avg >= 5.0:
-        # Informational: Moderate rate, worth monitoring
-        findings.append(Finding(
-            metric_name='ConnectionCreationRate',
-            severity=Severity.INFORMATIONAL,
-            category=Category.PERFORMANCE,
-            title='Moderate Connection Creation Rate',
-            description=(
-                f'Connection creation rate: P95={cluster_p95:.1f} conn/sec, '
-                f'avg={cluster_avg:.1f} conn/sec, max={cluster_max:.1f} conn/sec. '
-                f'Rate is within acceptable range. Monitor for increases that may indicate client issues.'
-            ),
-            current_value=cluster_avg,
-            threshold_value=None,
-            evidence={
-                'cluster_avg': cluster_avg,
-                'cluster_p95': cluster_p95,
-                'cluster_max': cluster_max,
-                'broker_count': len(broker_metrics),
-                'iam_auth_enabled': is_iam_auth
-            }
-        ))
-    else:
-        # Healthy: Low connection creation rate
-        findings.append(Finding(
-            metric_name='ConnectionCreationRate',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='Low Connection Creation Rate',
-            description=(
-                f'Connection creation rate is low: P95={cluster_p95:.1f} conn/sec, '
-                f'avg={cluster_avg:.1f} conn/sec. This indicates stable client connections.'
-            ),
-            current_value=cluster_avg,
-            threshold_value=None,
-            evidence={
-                'cluster_avg': cluster_avg,
-                'cluster_p95': cluster_p95,
-                'cluster_max': cluster_max,
-                'broker_count': len(broker_metrics),
-                'iam_auth_enabled': is_iam_auth
-            }
-        ))
-    
-    return findings
-
-
-def analyze_connection_churn(
-    creation_rate: MetricData,
-    close_rate: MetricData
-) -> List[Finding]:
-    """
-    Analyze connection creation and close rates to detect instability.
-    
-    Note: Connection patterns vary significantly by workload type:
-    - Batch jobs: Higher churn is normal
-    - Streaming apps: Should have stable connections
-    - Serverless: High churn expected
-    
-    These metrics should be monitored continuously and interpreted in context.
-    """
-    findings = []
-    
-    avg_creation = creation_rate.statistics['avg']
-    avg_close = close_rate.statistics['avg']
-    max_creation = creation_rate.statistics['max']
-    max_close = close_rate.statistics['max']
-    
-    # Calculate churn rate (average of creation and close rates)
-    churn_rate = (avg_creation + avg_close) / 2
-    
-    # High churn detection
-    if churn_rate >= 20.0:
-        findings.append(Finding(
-            metric_name='ConnectionChurn',
-            severity=Severity.CRITICAL,
-            category=Category.PERFORMANCE,
-            title='Excessive Connection Churn',
-            description=f'High connection churn rate ({churn_rate:.1f} connections/sec). This may indicate missing connection pooling, short timeouts, or network issues. Note: Connection patterns vary by workload - batch jobs and serverless applications naturally have higher churn.',
-            current_value=churn_rate,
-            threshold_value=20.0,
-            evidence={
-                'avg_creation_rate': avg_creation,
-                'avg_close_rate': avg_close,
-                'max_creation_rate': max_creation,
-                'max_close_rate': max_close,
-                'churn_rate': churn_rate
-            }
-        ))
-    elif churn_rate >= 10.0:
-        findings.append(Finding(
-            metric_name='ConnectionChurn',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='Elevated Connection Churn',
-            description=f'Moderate connection churn rate ({churn_rate:.1f} connections/sec). Monitor for patterns - this may be normal for your workload or indicate optimization opportunities. Consider connection pooling if using short-lived clients.',
-            current_value=churn_rate,
-            threshold_value=10.0,
-            evidence={
-                'avg_creation_rate': avg_creation,
-                'avg_close_rate': avg_close,
-                'max_creation_rate': max_creation,
-                'max_close_rate': max_close,
-                'churn_rate': churn_rate
-            }
-        ))
-    
-    # Imbalanced creation/close ratio
-    if avg_close > 0:
-        ratio = avg_creation / avg_close
-        if ratio > 1.5 or ratio < 0.7:
-            findings.append(Finding(
-                metric_name='ConnectionChurn',
-                severity=Severity.INFORMATIONAL,
-                category=Category.PERFORMANCE,
-                title='Imbalanced Connection Creation/Close Ratio',
-                description=f'Connection creation/close ratio is {ratio:.2f} (creation: {avg_creation:.1f}/sec, close: {avg_close:.1f}/sec). Ratio should be close to 1.0 for stable workloads. Variations are normal for dynamic workloads and should be monitored in context.',
-                current_value=ratio,
-                threshold_value=1.0,
-                evidence={
-                    'avg_creation_rate': avg_creation,
-                    'avg_close_rate': avg_close,
-                    'ratio': ratio
-                }
-            ))
-    
-    return findings
+def analyze_kafka_version(cluster_info: ClusterInfo, allow_network: bool = True) -> List[Finding]:
+    """Kafka version against MSK's version catalog (ListKafkaVersions status) and the documented
+    recommended version when it can be fetched."""
+    current = cluster_info.kafka_version
+    status = (cluster_info.kafka_version_status or 'unknown').upper()
+    recommended = get_recommended_kafka_version(allow_network)
+    active = [v['version'] for v in cluster_info.kafka_versions_catalog if (v.get('status') or '').upper() == 'ACTIVE']
+    latest_active = active[0] if active else None
+    reference_version = recommended['version']
+    reference_source = recommended['source']
+    if not reference_version and latest_active:
+        reference_version = '.'.join(str(x) for x in parse_version(latest_active)[:2])
+        reference_source = 'ListKafkaVersions API (latest ACTIVE version)'
+    ev = {'current_version': current, 'version_status': status, 'reference_version': reference_version,
+          'reference_source': reference_source, 'reference_fetched_at': recommended.get('fetched_at'),
+          'reference_error': recommended.get('error'), 'latest_active_version': latest_active}
+    common = dict(check_id='kafka_version', metric_name='KafkaVersion', category=Category.RELIABILITY,
+                  source='kafka_versions', section='configuration')
+    if status == 'DEPRECATED':
+        return [_finding(severity=Severity.WARNING, title='Kafka version is deprecated on MSK',
+                         description=(f'The cluster runs Kafka {current}, which MSK lists as DEPRECATED. Deprecated versions '
+                                      'reach end of support and stop receiving fixes; plan an in-place upgrade to a '
+                                      f'supported version{f" (reference: {reference_version})" if reference_version else ""}.'),
+                         value=None, evidence=ev, observed=f'{current} (DEPRECATED)', threshold_text='supported version', **common)]
+    if not reference_version:
+        return [not_assessed('kafka_version', 'KafkaVersion', Category.RELIABILITY, 'Kafka version',
+                             'Neither the documentation page nor the MSK version catalog could be consulted '
+                             f'({recommended.get("error")}).', section='configuration', source='kafka_versions')]
+    cur = parse_version(current)[:2]
+    rec = parse_version(reference_version)[:2]
+    conf = 'high' if recommended['version'] else 'medium'
+    src = 'AWS documentation' if recommended['version'] else 'MSK version catalog'
+    if cur < rec:
+        gap = (rec[0] - cur[0]) * 10 + (rec[1] - cur[1]) if len(cur) > 1 and len(rec) > 1 else 1
+        sev = Severity.WARNING if gap >= 2 else Severity.INFORMATIONAL
+        return [_finding(severity=sev, title='Newer Kafka version available',
+                         description=(f'The cluster runs Kafka {current}; the {src} indicates {reference_version}.x as the '
+                                      'reference version. Newer versions bring fixes and features; MSK performs in-place '
+                                      'rolling upgrades.'),
+                         value=None, evidence=ev, observed=current, threshold_text=f'{reference_version}.x', confidence=conf, **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Kafka version is current',
+                     description=f'The cluster runs Kafka {current}; reference version from the {src} is {reference_version}.x.',
+                     value=None, evidence=ev, observed=current, threshold_text=f'{reference_version}.x', confidence=conf, **common)]
 
 
 def analyze_authentication_methods(cluster_info: ClusterInfo) -> List[Finding]:
-    """Check for security best practices."""
-    findings = []
-    
-    if 'unauthenticated' in cluster_info.authentication_methods:
-        findings.append(Finding(
-            metric_name='Authentication',
-            severity=Severity.CRITICAL,
-            category=Category.SECURITY,
-            title='Unauthenticated Access Enabled',
-            description='Cluster allows unauthenticated access. This is a critical security risk.',
-            current_value=None,
-            threshold_value=None,
-            evidence={'methods': cluster_info.authentication_methods}
-        ))
-    
-    if len(cluster_info.authentication_methods) == 1:
-        findings.append(Finding(
-            metric_name='Authentication',
-            severity=Severity.INFORMATIONAL,
-            category=Category.SECURITY,
-            title='Single Authentication Method',
-            description='Only one authentication method enabled. Consider enabling multiple methods for flexibility.',
-            current_value=None,
-            threshold_value=None,
-            evidence={'methods': cluster_info.authentication_methods}
-        ))
-    
-    if 'SASL/SCRAM' in cluster_info.authentication_methods:
-        findings.append(Finding(
-            metric_name='Authentication',
-            severity=Severity.INFORMATIONAL,
-            category=Category.SECURITY,
-            title='SASL/SCRAM Authentication',
-            description='SASL/SCRAM enabled. Ensure regular credential rotation practices.',
-            current_value=None,
-            threshold_value=None,
-            evidence={'methods': cluster_info.authentication_methods}
-        ))
-    
-    return findings
+    methods = cluster_info.authentication_methods
+    ev = {'methods': methods, 'public_access': cluster_info.public_access}
+    common = dict(check_id='authentication', metric_name='Authentication', category=Category.SECURITY,
+                  source='authentication', section='configuration')
+    if 'unauthenticated' in methods:
+        others = [m for m in methods if m != 'unauthenticated']
+        return [_finding(severity=Severity.CRITICAL, title='Unauthenticated client access is enabled',
+                         description=('The cluster accepts unauthenticated connections' +
+                                      (f' alongside {", ".join(others)}' if others else '') +
+                                      '. Any client with network access to the brokers can produce and consume. '
+                                      'Migrate clients to IAM, SASL/SCRAM or mTLS and disable the unauthenticated listener.'),
+                         value=None, evidence=ev, observed='unauthenticated enabled', threshold_text='authenticated listeners only', **common)]
+    if not methods:
+        return [not_assessed('authentication', 'Authentication', Category.SECURITY, 'Client authentication',
+                             'No authentication block was returned for the cluster.', section='configuration')]
+    return [_finding(severity=Severity.HEALTHY, title='Only authenticated client access',
+                     description=f'Enabled authentication: {", ".join(methods)}.', value=None, evidence=ev,
+                     observed=', '.join(methods), threshold_text='authenticated listeners only', **common)]
 
 
-def analyze_instance_type(
-    cluster_info: ClusterInfo,
-    metrics: MetricsCollection
-) -> List[Finding]:
-    """Check for cost optimization opportunities."""
-    findings = []
-    
-    if cluster_info.instance_family == 'intel':
-        # Calculate potential savings (Graviton is ~20% cheaper)
-        savings_percentage = 20
-        
-        findings.append(Finding(
-            metric_name='InstanceType',
-            severity=Severity.INFORMATIONAL,
-            category=Category.COST,
-            title='Graviton Migration Opportunity',
-            description=f'Cluster uses Intel instances ({cluster_info.instance_type}). Migrating to Graviton could save ~{savings_percentage}% on compute costs.',
-            current_value=None,
-            threshold_value=None,
-            evidence={
-                'current_type': cluster_info.instance_type,
-                'instance_family': cluster_info.instance_family,
-                'estimated_savings': savings_percentage
-            }
-        ))
+def analyze_encryption(cluster_info: ClusterInfo) -> List[Finding]:
+    findings: List[Finding] = []
+    mode = cluster_info.encryption_in_transit_type
+    ev = {'client_broker': mode, 'in_cluster': cluster_info.in_cluster_encryption, 'kms_key': cluster_info.kms_key_arn}
+    common = dict(check_id='encryption_in_transit', metric_name='EncryptionInTransit', category=Category.SECURITY,
+                  source='encryption', section='configuration', threshold_text='TLS')
+    if mode == 'PLAINTEXT':
+        findings.append(_finding(severity=Severity.CRITICAL, title='Client traffic is not encrypted',
+                                 description='Client-broker encryption is PLAINTEXT; data and credentials cross the network unencrypted.',
+                                 value=None, evidence=ev, observed='PLAINTEXT', **common))
+    elif mode == 'TLS_PLAINTEXT':
+        findings.append(_finding(severity=Severity.WARNING, title='Plaintext client listener still enabled',
+                                 description=('Client-broker encryption is TLS_PLAINTEXT: TLS is available but a plaintext listener '
+                                              'remains open. Move remaining clients to TLS and switch the setting to TLS.'),
+                                 value=None, evidence=ev, observed='TLS_PLAINTEXT', **common))
     else:
-        findings.append(Finding(
-            metric_name='InstanceType',
-            severity=Severity.HEALTHY,
-            category=Category.COST,
-            title='Cost-Optimized Instance Type',
-            description=f'Cluster uses Graviton instances ({cluster_info.instance_type}), which are cost-optimized.',
-            current_value=None,
-            threshold_value=None,
-            evidence={
-                'current_type': cluster_info.instance_type,
-                'instance_family': cluster_info.instance_family
-            }
-        ))
-    
+        findings.append(_finding(severity=Severity.HEALTHY, title='Client traffic encrypted with TLS',
+                                 description='Client-broker encryption is TLS only.', value=None, evidence=ev, observed='TLS', **common))
+    if cluster_info.in_cluster_encryption is False:
+        findings.append(_finding(check_id='encryption_in_cluster', metric_name='EncryptionInCluster', severity=Severity.WARNING,
+                                 category=Category.SECURITY, title='Broker-to-broker traffic is not encrypted',
+                                 description='In-cluster (replication) encryption is disabled.', value=None, evidence=ev,
+                                 observed='disabled', threshold_text='enabled', source='encryption', section='configuration'))
+    key = cluster_info.kms_key_arn or ''
+    findings.append(_finding(check_id='encryption_at_rest', metric_name='EncryptionAtRest', severity=Severity.HEALTHY,
+                             category=Category.SECURITY, title='Data encrypted at rest',
+                             description=('Broker volumes are encrypted with KMS key ' + (key if key else '(AWS managed)') + '.'),
+                             value=None, evidence=ev, observed='KMS', threshold_text='enabled', source='encryption',
+                             section='configuration'))
+    if cluster_info.public_access != 'DISABLED':
+        findings.append(_finding(check_id='public_access', metric_name='PublicAccess', severity=Severity.INFORMATIONAL,
+                                 category=Category.SECURITY, title='Brokers reachable from the internet',
+                                 description=('Public access is enabled (service-provided elastic IPs). MSK requires TLS and '
+                                              'authentication for public listeners; review security groups and IAM/ACL policies '
+                                              'so that only intended principals can connect.'),
+                                 value=None, evidence=ev, observed=cluster_info.public_access, source='public_access',
+                                 section='configuration', confidence='medium'))
     return findings
 
 
-def analyze_partition_count(
-    metric: MetricData,
-    cluster_info: ClusterInfo
-) -> List[Finding]:
-    """
-    Analyze if partition count is appropriate for cluster capacity.
-    
-    Based on AWS MSK documentation:
-    https://docs.aws.amazon.com/msk/latest/developerguide/broker-instance-sizes.html
-    """
-    findings = []
-    
-    # Partition limits per broker based on AWS documentation
-    partition_limits = {
-        # T3 instances
-        'kafka.t3.small': 300,
-        # M5 instances
-        'kafka.m5.large': 1000,
-        'kafka.m5.xlarge': 1500,
-        'kafka.m5.2xlarge': 2000,
-        'kafka.m5.4xlarge': 4000,
-        'kafka.m5.8xlarge': 8000,
-        'kafka.m5.12xlarge': 12000,
-        'kafka.m5.16xlarge': 16000,
-        'kafka.m5.24xlarge': 24000,
-        # M7g instances (Graviton3)
-        'kafka.m7g.large': 1000,
-        'kafka.m7g.xlarge': 1500,
-        'kafka.m7g.2xlarge': 2000,
-        'kafka.m7g.4xlarge': 4000,
-        'kafka.m7g.8xlarge': 8000,
-        'kafka.m7g.12xlarge': 12000,
-        'kafka.m7g.16xlarge': 16000,
-        # Express instances (maximum limits)
-        'express.m7g.large': 1500,
-        'express.m7g.xlarge': 2000,
-        'express.m7g.2xlarge': 4000,
-        'express.m7g.4xlarge': 8000,
-        'express.m7g.8xlarge': 16000,
-        'express.m7g.12xlarge': 24000,
-        'express.m7g.16xlarge': 32000,
-    }
-    
-    limit_per_broker = partition_limits.get(cluster_info.instance_type, 1000)
-    max_recommended = limit_per_broker * cluster_info.broker_count
-    
-    # Use current value (last collected) instead of average
-    current_partitions = int(metric.values[-1]) if metric.values else int(metric.statistics['avg'])
-    utilization = (current_partitions / max_recommended) * 100
-    
-    if utilization > 100.0:
-        findings.append(Finding(
-            metric_name='GlobalPartitionCount',
-            severity=Severity.CRITICAL,
-            category=Category.PERFORMANCE,
-            title='Partition Count Exceeded Capacity',
-            description=f'Partition count ({current_partitions}) exceeds cluster capacity ({max_recommended}). Immediate action required.',
-            current_value=float(current_partitions),
-            threshold_value=float(max_recommended),
-            evidence={
-                'current_partitions': current_partitions,
-                'max_recommended': max_recommended,
-                'limit_per_broker': limit_per_broker,
-                'broker_count': cluster_info.broker_count,
-                'instance_type': cluster_info.instance_type
-            }
-        ))
-    elif utilization >= 90.0:
-        findings.append(Finding(
-            metric_name='GlobalPartitionCount',
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title='Partition Count Near Capacity',
-            description=f'Partition count ({current_partitions}) at {utilization:.1f}% of cluster capacity ({max_recommended}). Plan capacity expansion.',
-            current_value=float(current_partitions),
-            threshold_value=float(max_recommended),
-            evidence={
-                'current_partitions': current_partitions,
-                'max_recommended': max_recommended,
-                'limit_per_broker': limit_per_broker,
-                'broker_count': cluster_info.broker_count,
-                'instance_type': cluster_info.instance_type
-            }
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='GlobalPartitionCount',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='Partition Count OK',
-            description=f'Partition count ({current_partitions}) at {utilization:.1f}% of cluster capacity ({max_recommended}). Within healthy range.',
-            current_value=float(current_partitions),
-            threshold_value=float(max_recommended),
-            evidence={
-                'current_partitions': current_partitions,
-                'max_recommended': max_recommended,
-                'limit_per_broker': limit_per_broker,
-                'broker_count': cluster_info.broker_count,
-                'instance_type': cluster_info.instance_type
-            }
-        ))
-    
-    return findings
+def analyze_logging_configuration(cluster_info: ClusterInfo, workload: str) -> List[Finding]:
+    ev = {'enabled': cluster_info.logging_enabled, 'destinations': cluster_info.logging_destinations}
+    common = dict(check_id='broker_logging', metric_name='Logging', category=Category.SECURITY, source='logging',
+                  section='configuration', threshold_text='broker logs delivered to at least one destination')
+    if cluster_info.logging_enabled:
+        return [_finding(severity=Severity.HEALTHY, title='Broker logs delivered',
+                         description=f'Broker logs are sent to: {", ".join(cluster_info.logging_destinations)}.',
+                         value=1.0, evidence=ev, observed=', '.join(cluster_info.logging_destinations), **common)]
+    sev = Severity.WARNING if workload == 'production' else Severity.INFORMATIONAL
+    return [_finding(severity=sev, title='Broker logs not delivered',
+                     description=('Broker logs are not sent to CloudWatch Logs, S3 or Firehose. Without them, incidents '
+                                  '(authentication failures, leader elections, disk errors) cannot be investigated after the fact.'),
+                     value=0.0, evidence=ev, observed='disabled', **common)]
 
 
-def get_recommended_kafka_version() -> str:
-    """
-    Get recommended Kafka version from AWS documentation.
-    Scrapes https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html
-    
-    Returns:
-        Recommended version string (e.g., "3.8") or "3.8" as fallback
-    """
-    try:
-        import urllib.request
-        import re
-        
-        # Static AWS documentation URL - hardcoded to prevent file:// or custom schemes
-        url = "https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html"
-        
-        # Validate URL scheme to prevent file:// access
-        if not url.startswith("https://"):
-            logger.warning("Invalid URL scheme, using fallback version: 3.8")
-            return "3.8"
-        
-        request = urllib.request.Request(url, headers={'User-Agent': 'MSK-Health-Check/1.0'})
-        # nosemgrep: dynamic-urllib-use-detected
-        with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310
-            html = response.read().decode('utf-8')
-            
-        # Look for pattern: "version 3.8.x (Recommended)" or "Amazon MSK version 3.8.x (Recommended)"
-        pattern = r'version\s+(\d+\.\d+)\.x\s*\(Recommended\)'
-        match = re.search(pattern, html, re.IGNORECASE)
-        
-        if match:
-            recommended = match.group(1)
-            logger.info(f"Found recommended Kafka version from AWS docs: {recommended}")
-            return recommended
-        
-        logger.warning("Could not find recommended version in AWS docs, using fallback: 3.8")
-        return "3.8"
-        
-    except Exception as e:
-        logger.warning(f"Error fetching recommended version from AWS docs: {e}, using fallback: 3.8")
-        return "3.8"
-
-
-def analyze_kafka_version(cluster_info: ClusterInfo) -> List[Finding]:
-    """
-    Analyze Kafka version against AWS recommended version.
-    Fetches recommended version from AWS documentation in real-time.
-    """
-    findings = []
-    current_version = cluster_info.kafka_version
-    
-    # Get recommended version from AWS docs
-    recommended_version = get_recommended_kafka_version()
-    
-    try:
-        # Parse versions for comparison
-        current_parts = current_version.split('.')
-        rec_parts = recommended_version.split('.')
-        
-        if len(current_parts) >= 2 and len(rec_parts) >= 2:
-            current_major = int(current_parts[0])
-            current_minor = int(current_parts[1])
-            rec_major = int(rec_parts[0])
-            rec_minor = int(rec_parts[1])
-            
-            # Calculate version gap
-            version_gap = (rec_major - current_major) * 10 + (rec_minor - current_minor)
-            
-            if version_gap >= 5:
-                findings.append(Finding(
-                    metric_name='KafkaVersion',
-                    severity=Severity.CRITICAL,
-                    category=Category.RELIABILITY,
-                    title='Kafka Version Severely Outdated',
-                    description=f'Cluster running Kafka {current_version}. AWS recommends version {recommended_version}.x for latest features and security patches.',
-                    current_value=None,
-                    threshold_value=None,
-                    evidence={
-                        'current_version': current_version,
-                        'recommended_version': f'{recommended_version}.x',
-                        'version_gap': version_gap,
-                        'docs_url': 'https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html'
-                    }
-                ))
-            elif version_gap > 0:
-                findings.append(Finding(
-                    metric_name='KafkaVersion',
-                    severity=Severity.WARNING,
-                    category=Category.RELIABILITY,
-                    title='Kafka Version Upgrade Available',
-                    description=f'Cluster running Kafka {current_version}. AWS recommends upgrading to {recommended_version}.x for latest features and security patches.',
-                    current_value=None,
-                    threshold_value=None,
-                    evidence={
-                        'current_version': current_version,
-                        'recommended_version': f'{recommended_version}.x',
-                        'version_gap': version_gap,
-                        'docs_url': 'https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html'
-                    }
-                ))
-            elif version_gap == 0:
-                findings.append(Finding(
-                    metric_name='KafkaVersion',
-                    severity=Severity.HEALTHY,
-                    category=Category.RELIABILITY,
-                    title='Kafka Version Up-to-Date',
-                    description=f'Cluster running AWS recommended Kafka version {current_version}.',
-                    current_value=None,
-                    threshold_value=None,
-                    evidence={
-                        'current_version': current_version,
-                        'recommended_version': f'{recommended_version}.x'
-                    }
-                ))
-            else:
-                # Current version is newer than recommended
-                findings.append(Finding(
-                    metric_name='KafkaVersion',
-                    severity=Severity.INFORMATIONAL,
-                    category=Category.RELIABILITY,
-                    title='Kafka Version Newer Than Recommended',
-                    description=f'Cluster running Kafka {current_version}, which is newer than AWS recommended {recommended_version}.x.',
-                    current_value=None,
-                    threshold_value=None,
-                    evidence={
-                        'current_version': current_version,
-                        'recommended_version': f'{recommended_version}.x'
-                    }
-                ))
-    except (ValueError, IndexError) as e:
-        logger.warning(f"Could not parse Kafka versions: {e}")
-        findings.append(Finding(
-            metric_name='KafkaVersion',
-            severity=Severity.INFORMATIONAL,
-            category=Category.RELIABILITY,
-            title='Kafka Version Check',
-            description=f'Cluster running Kafka {current_version}. AWS recommends {recommended_version}.x.',
-            current_value=None,
-            threshold_value=None,
-            evidence={'current_version': current_version, 'recommended_version': f'{recommended_version}.x'}
-        ))
-    
-    return findings
-
-
-def analyze_availability_zones(cluster_info: ClusterInfo) -> List[Finding]:
-    """Check if cluster is deployed across multiple AZs."""
-    findings = []
-    az_count = cluster_info.availability_zones
-    
-    if az_count < 2:
-        findings.append(Finding(
-            metric_name='AvailabilityZones',
-            severity=Severity.CRITICAL,
-            category=Category.RELIABILITY,
-            title='Single AZ Deployment',
-            description=f'Cluster deployed in only {az_count} AZ. MSK requires at least 2 AZs for high availability.',
-            current_value=float(az_count),
-            threshold_value=2.0,
-            evidence={'az_count': az_count}
-        ))
-    elif az_count == 2:
-        findings.append(Finding(
-            metric_name='AvailabilityZones',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Two AZ Deployment',
-            description=f'Cluster deployed across {az_count} AZs. For critical/production workloads, 3 AZs is recommended for better fault tolerance.',
-            current_value=float(az_count),
-            threshold_value=3.0,
-            evidence={'az_count': az_count}
-        ))
-    else:  # 3 or more AZs
-        findings.append(Finding(
-            metric_name='AvailabilityZones',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='Multi-AZ Deployment',
-            description=f'Cluster deployed across {az_count} AZs, providing excellent fault tolerance.',
-            current_value=float(az_count),
-            threshold_value=3.0,
-            evidence={'az_count': az_count}
-        ))
-    
-    return findings
-
-
-def analyze_storage_auto_scaling(cluster_info: ClusterInfo) -> List[Finding]:
-    """Check if storage auto-scaling is enabled (PROVISIONED/STANDARD only)."""
-    findings = []
-    
-    # Skip for EXPRESS clusters (serverless storage)
-    if cluster_info.cluster_type == 'EXPRESS':
-        return findings
-    
-    if not cluster_info.storage_auto_scaling_enabled:
-        findings.append(Finding(
-            metric_name='StorageAutoScaling',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Storage Auto-Scaling Disabled',
-            description='Storage auto-scaling is not enabled. Enable it to automatically increase storage capacity and prevent disk space issues.',
-            current_value=0.0,
-            threshold_value=1.0,
-            evidence={'enabled': False}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='StorageAutoScaling',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='Storage Auto-Scaling Enabled',
-            description='Storage auto-scaling is enabled, providing automatic capacity management.',
-            current_value=1.0,
-            threshold_value=1.0,
-            evidence={'enabled': True}
-        ))
-    
-    return findings
-
-
-def analyze_logging_configuration(cluster_info: ClusterInfo) -> List[Finding]:
-    """Check if logging is enabled."""
-    findings = []
-    
-    if not cluster_info.logging_enabled:
-        findings.append(Finding(
-            metric_name='Logging',
-            severity=Severity.WARNING,
-            category=Category.SECURITY,
-            title='Logging Disabled',
-            description='Broker logs are not being sent to CloudWatch, S3, or Firehose. Enable logging for production/critical environments for troubleshooting and compliance.',
-            current_value=0.0,
-            threshold_value=1.0,
-            evidence={'enabled': False, 'destinations': []}
-        ))
-    else:
-        destinations_str = ', '.join(cluster_info.logging_destinations)
-        findings.append(Finding(
-            metric_name='Logging',
-            severity=Severity.HEALTHY,
-            category=Category.SECURITY,
-            title='Logging Enabled',
-            description=f'Broker logs are being sent to: {destinations_str}.',
-            current_value=1.0,
-            threshold_value=1.0,
-            evidence={'enabled': True, 'destinations': cluster_info.logging_destinations}
-        ))
-    
-    return findings
-
-
-def analyze_enhanced_monitoring(cluster_info: ClusterInfo) -> List[Finding]:
-    """Check if enhanced monitoring is enabled."""
-    findings = []
-    
-    if cluster_info.enhanced_monitoring_level != 'PER_BROKER':
-        findings.append(Finding(
-            metric_name='EnhancedMonitoring',
-            severity=Severity.INFORMATIONAL,
-            category=Category.PERFORMANCE,
-            title='Enhanced Monitoring Not Enabled',
-            description=(
-                f"Enhanced monitoring is set to '{cluster_info.enhanced_monitoring_level}'. "
-                f"Consider enabling 'PER_BROKER' monitoring for better observability. "
-                f"\n\nBenefits of PER_BROKER monitoring:\n"
-                f"• Detect broker-level imbalances (CPU, memory, disk, network per broker)\n"
-                f"• Identify hot brokers and partition distribution issues\n"
-                f"• Faster troubleshooting with granular metrics\n"
-                f"• Better capacity planning and right-sizing decisions\n"
-                f"• No impact on cluster performance\n\n"
-                f"With DEFAULT monitoring, you only see cluster-wide aggregated metrics, which can hide "
-                f"individual broker issues. PER_BROKER provides the visibility needed to detect and resolve "
-                f"imbalances before they impact performance."
-            ),
-            current_value=0.0,
-            threshold_value=1.0,
-            evidence={'current_level': cluster_info.enhanced_monitoring_level, 'recommended_level': 'PER_BROKER'}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='EnhancedMonitoring',
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title='Enhanced Monitoring Enabled',
-            description=f"Enhanced monitoring is set to 'PER_BROKER', providing granular per-broker metrics for better observability.",
-            current_value=1.0,
-            threshold_value=1.0,
-            evidence={'current_level': cluster_info.enhanced_monitoring_level}
-        ))
-    
-    return findings
-
-
-def analyze_consumer_lag(
-    estimated_lag: Optional[MetricData],
-    max_offset_lag: Optional[MetricData],
-    sum_offset_lag: Optional[MetricData]
-) -> List[Finding]:
-    """Analyze consumer lag metrics."""
-    findings = []
-    
-    if estimated_lag:
-        max_time_lag = estimated_lag.statistics['max']
-        if max_time_lag > 0:
-            findings.append(Finding(
-                metric_name='EstimatedMaxTimeLag',
-                severity=Severity.WARNING,
-                category=Category.PERFORMANCE,
-                title='Consumer Lag Detected',
-                description=f'Maximum estimated time lag: {max_time_lag:.0f} seconds. Consumers may be falling behind producers. Review consumer performance and scaling.',
-                current_value=max_time_lag,
-                threshold_value=0.0,
-                evidence={'statistics': estimated_lag.statistics}
-            ))
-    
-    if max_offset_lag:
-        max_offset = max_offset_lag.statistics['max']
-        if max_offset > 0:
-            findings.append(Finding(
-                metric_name='MaxOffsetLag',
-                severity=Severity.INFORMATIONAL,
-                category=Category.PERFORMANCE,
-                title='Offset Lag Present',
-                description=f'Maximum offset lag: {max_offset:.0f} messages. Monitor consumer group performance.',
-                current_value=max_offset,
-                threshold_value=None,
-                evidence={'statistics': max_offset_lag.statistics}
-            ))
-    
-    return findings
+def analyze_enhanced_monitoring(cluster_info: ClusterInfo, metrics: MetricsCollection) -> List[Finding]:
+    level = cluster_info.enhanced_monitoring_level
+    skipped = sorted(n for n, r in metrics.not_published.items() if 'enhanced monitoring' in r)
+    ev = {'level': level, 'checks_limited_by_level': skipped}
+    common = dict(check_id='enhanced_monitoring', metric_name='EnhancedMonitoring', category=Category.PERFORMANCE,
+                  source='monitoring', section='configuration', threshold_text='PER_BROKER or higher')
+    if ref.monitoring_level_rank(level) >= 1:
+        return [_finding(severity=Severity.HEALTHY, title=f'Enhanced monitoring at {level}',
+                         description='Per-broker connection rate and throttling metrics are available to this analysis.',
+                         value=1.0, evidence=ev, observed=level, **common)]
+    return [_finding(severity=Severity.INFORMATIONAL, title='Enhanced monitoring at DEFAULT level',
+                     description=('DEFAULT-level metrics (free) already include per-broker CPU, memory, disk, partitions and '
+                                  'connections. PER_BROKER adds ConnectionCreationRate, IAMTooManyConnections and throttle '
+                                  'metrics; the following checks were limited by the current level: ' +
+                                  (', '.join(skipped) if skipped else 'none') + '.'),
+                     value=0.0, evidence=ev, observed=level, **common)]
 
 
 def analyze_intelligent_rebalancing(cluster_info: ClusterInfo) -> List[Finding]:
-    """Check if intelligent rebalancing is enabled for EXPRESS clusters."""
-    findings = []
-    
-    # Only applicable to EXPRESS clusters
-    if cluster_info.cluster_type != 'EXPRESS':
-        return findings
-    
-    if not cluster_info.intelligent_rebalancing_enabled:
-        findings.append(Finding(
-            metric_name='IntelligentRebalancing',
-            severity=Severity.WARNING,
-            category=Category.RELIABILITY,
-            title='Intelligent Rebalancing Disabled',
-            description='Intelligent rebalancing is not enabled. For production workloads, enabling this feature helps maintain balanced partition distribution and optimal performance.',
-            current_value=0.0,
-            threshold_value=1.0,
-            evidence={'enabled': False, 'cluster_type': 'EXPRESS'}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name='IntelligentRebalancing',
-            severity=Severity.HEALTHY,
-            category=Category.RELIABILITY,
-            title='Intelligent Rebalancing Enabled',
-            description='Intelligent rebalancing is enabled, ensuring optimal partition distribution across brokers.',
-            current_value=1.0,
-            threshold_value=1.0,
-            evidence={'enabled': True, 'cluster_type': 'EXPRESS'}
-        ))
-    
-    return findings
+    if not cluster_info.is_express:
+        return []
+    common = dict(check_id='intelligent_rebalancing', metric_name='IntelligentRebalancing', category=Category.RELIABILITY,
+                  source='best_practices_express', section='configuration', threshold_text='ACTIVE')
+    status = cluster_info.rebalancing_status
+    if status is None:
+        return [not_assessed('intelligent_rebalancing', 'IntelligentRebalancing', Category.RELIABILITY,
+                             'Intelligent rebalancing', 'DescribeClusterV2 did not return the Rebalancing field '
+                             '(requires boto3/botocore with the 2025 Kafka API model).', section='configuration')]
+    ev = {'status': status}
+    if status == 'ACTIVE':
+        return [_finding(severity=Severity.HEALTHY, title='Intelligent rebalancing active',
+                         description='MSK redistributes partitions automatically on this Express cluster.',
+                         value=1.0, evidence=ev, observed=status, **common)]
+    return [_finding(severity=Severity.INFORMATIONAL, title='Intelligent rebalancing not active',
+                     description=f'Rebalancing status is {status}. Partition skew has to be corrected manually until it is enabled.',
+                     value=0.0, evidence=ev, observed=status, **common)]
 
 
-def analyze_per_broker_metrics(broker_metrics: List[MetricData], metric_name: str, cluster_info: ClusterInfo) -> List[Finding]:
+# --------------------------------------------------------------------------- cost checks
+
+def analyze_instance_type(cluster_info: ClusterInfo) -> List[Finding]:
+    common = dict(check_id='graviton', metric_name='InstanceType', category=Category.COST, source='graviton',
+                  section='configuration')
+    ev = {'instance_type': cluster_info.instance_type, 'family': cluster_info.instance_family}
+    if cluster_info.instance_family == 'graviton':
+        return [_finding(severity=Severity.HEALTHY, title='Graviton broker size in use',
+                         description=f'{cluster_info.instance_type} is Graviton-based.', value=None, evidence=ev,
+                         observed=cluster_info.instance_type, **common)]
+    equivalent = ref.has_graviton_equivalent(cluster_info.instance_type)
+    if cluster_info.instance_family == 'intel' and equivalent:
+        return [_finding(severity=Severity.INFORMATIONAL, title='Graviton equivalent available',
+                         description=(f'{cluster_info.instance_type} has a Graviton counterpart ({equivalent}). AWS positions M7g '
+                                      'brokers as better price-performance; compare hourly prices for this Region on the MSK '
+                                      'pricing page and validate with a load test before a size update.'),
+                         value=None, evidence={**ev, 'graviton_equivalent': equivalent}, observed=cluster_info.instance_type,
+                         confidence='medium', **common)]
+    if cluster_info.instance_family == 'intel':
+        return [_finding(severity=Severity.INFORMATIONAL, title='No Graviton counterpart for this size',
+                         description=f'{cluster_info.instance_type} has no Graviton equivalent in MSK.', value=None,
+                         evidence=ev, observed=cluster_info.instance_type, **common)]
+    return [not_assessed('graviton', 'InstanceType', Category.COST, 'Broker family',
+                         f'Broker size {cluster_info.instance_type} is not in the catalog.', section='configuration')]
+
+
+def analyze_right_sizing(cluster_info: ClusterInfo, findings: List[Finding]) -> List[Finding]:
+    """Cost signal built from the utilisation checks already computed."""
+    by_id = {f.check_id: f for f in findings}
+    cpu = by_id.get('cpu_total'); tin = by_id.get('throughput_in'); tout = by_id.get('throughput_out')
+    parts = by_id.get('partition_capacity')
+    signals = []
+    ev: Dict[str, Any] = {}
+    if cpu and cpu.severity != Severity.NOT_ASSESSED and cpu.current_value is not None:
+        ev['cpu_p95_max'] = cpu.current_value
+        signals.append(cpu.current_value < 20.0)
+    for t in (tin, tout):
+        if t and t.severity != Severity.NOT_ASSESSED and t.threshold_value:
+            ev[t.check_id + '_p95_ratio'] = t.current_value / t.threshold_value
+            signals.append(t.current_value / t.threshold_value < 0.2)
+    if parts and parts.severity != Severity.NOT_ASSESSED and parts.threshold_value:
+        ev['partition_ratio'] = parts.current_value / parts.threshold_value
+        signals.append(parts.current_value / parts.threshold_value < 0.3)
+    common = dict(check_id='right_sizing', metric_name='RightSizing', category=Category.COST, source='broker_sizes',
+                  section='derived', confidence='low')
+    if len(signals) < 2:
+        return [not_assessed('right_sizing', 'RightSizing', Category.COST, 'Right-sizing signal',
+                             'Not enough utilisation checks were assessed to judge headroom.', section='derived')]
+    if all(signals):
+        return [_finding(severity=Severity.INFORMATIONAL, title='Large capacity headroom',
+                         description=('CPU P95, network throughput and partition replicas per broker are all far below the '
+                                      f'limits of {cluster_info.instance_type} over the window. If this is the steady state and '
+                                      'not a seasonal low, a smaller broker size or fewer brokers may serve the workload; '
+                                      'keep at least 3 brokers and replication factor 3.'),
+                         value=None, evidence=ev, observed='all utilisation signals < 20-30% of limits', **common)]
+    return [_finding(severity=Severity.HEALTHY, title='Utilisation consistent with the broker size',
+                     description='At least one utilisation dimension uses a meaningful share of the broker size limits.',
+                     value=None, evidence=ev, observed='no right-sizing signal', **common)]
+
+
+# --------------------------------------------------------------------------- orchestration
+
+def _require_brokers(metrics: MetricsCollection, name: str, check_id: str, category: Category, title: str,
+                     findings: List[Finding], chart: Optional[str] = None) -> Optional[List[MetricData]]:
+    brokers = metrics.broker_metrics(name)
+    if brokers:
+        return brokers
+    f = not_assessed(check_id, name, category, title, _missing_reason(metrics, name))
+    f.chart_metric = chart
+    findings.append(f)
+    return None
+
+
+def analyze_metrics(cluster_info: ClusterInfo, metrics: MetricsCollection, workload: str = 'production',
+                    allow_network: bool = True) -> AnalysisResult:
+    """Run every check and compute the health score.
+
+    Args:
+        cluster_info: cluster configuration
+        metrics: collected metrics
+        workload: 'production' or 'non-production' (adjusts severity of resilience recommendations)
+        allow_network: allow the documentation lookup for the recommended Kafka version
     """
-    Analyze per-broker metrics and detect imbalances.
-    For LeaderCount and PartitionCount, uses current values instead of averages.
-    """
-    findings = []
-    
-    if not broker_metrics:
-        return findings
-    
-    # Skip storage metrics for EXPRESS clusters (serverless storage)
-    if cluster_info.cluster_type == 'EXPRESS' and metric_name == 'KafkaDataLogsDiskUsed':
-        return findings
-    
-    # Special handling for ConnectionCreationRate - use dedicated analysis
-    if metric_name == 'ConnectionCreationRate':
-        return analyze_connection_creation_rate(broker_metrics, cluster_info)
-    
-    # For LeaderCount and PartitionCount, use current values (last collected)
-    # For other metrics, use averages
-    if metric_name in ['LeaderCount', 'PartitionCount']:
-        all_values = [m.values[-1] if m.values else m.statistics['avg'] for m in broker_metrics]
-        cluster_avg = np.mean(all_values)
-        cluster_max = max(all_values)
-        cluster_min = min(all_values)
+    findings: List[Finding] = []
+    express = cluster_info.is_express
+
+    # Reliability
+    m = metrics.cluster_metric('ActiveControllerCount')
+    findings.extend(analyze_active_controller_count(m) if m else
+                    [not_assessed('active_controller', 'ActiveControllerCount', Category.RELIABILITY, 'Active controller',
+                                  _missing_reason(metrics, 'ActiveControllerCount'))])
+    m = metrics.cluster_metric('OfflinePartitionsCount')
+    findings.extend(analyze_offline_partitions(m) if m else
+                    [not_assessed('offline_partitions', 'OfflinePartitionsCount', Category.RELIABILITY, 'Offline partitions',
+                                  _missing_reason(metrics, 'OfflinePartitionsCount'))])
+    b = _require_brokers(metrics, 'UnderMinIsrPartitionCount', 'under_min_isr', Category.RELIABILITY,
+                         'Partitions below min ISR', findings)
+    if b:
+        findings.extend(analyze_under_min_isr(b))
+    b = _require_brokers(metrics, 'UnderReplicatedPartitions', 'under_replicated', Category.RELIABILITY,
+                         'Under-replicated partitions', findings)
+    if b:
+        findings.extend(analyze_under_replicated(b))
+    if not express:
+        b = _require_brokers(metrics, 'KafkaDataLogsDiskUsed', 'disk_usage', Category.RELIABILITY, 'Data log disk usage', findings)
+        if b:
+            findings.extend(analyze_disk_usage(b, cluster_info))
+    findings.extend(analyze_availability_zones(cluster_info, workload))
+    findings.extend(analyze_storage_auto_scaling(cluster_info, workload))
+    findings.extend(analyze_kafka_version(cluster_info, allow_network))
+    findings.extend(analyze_intelligent_rebalancing(cluster_info))
+
+    # Performance
+    cpu_user = metrics.broker_metrics('CpuUser')
+    cpu_system = metrics.broker_metrics('CpuSystem')
+    if cpu_user and cpu_system:
+        findings.extend(analyze_cpu_total(cpu_user, cpu_system))
+        totals = cpu_total_series(cpu_user, cpu_system)
+        findings.extend(analyze_balance('cpu_balance', 'CpuTotal', {b_: d['stats']['avg'] for b_, d in totals.items()},
+                                        'Percent', cluster_info, chart='CpuTotal', title_noun='CPU load'))
     else:
-        # Calculate statistics across all brokers using averages
-        all_avgs = [m.statistics['avg'] for m in broker_metrics]
-        all_maxs = [m.statistics['max'] for m in broker_metrics]
-        cluster_avg = np.mean(all_avgs)
-        cluster_max = max(all_maxs)
-        cluster_min = min([m.statistics['min'] for m in broker_metrics])
-        all_values = all_avgs
-    
-    # Check per-broker partition capacity limits
-    if metric_name == 'PartitionCount':
-        partition_limits = {
-            'kafka.t3.small': 300, 'kafka.m5.large': 1000, 'kafka.m5.xlarge': 1500,
-            'kafka.m5.2xlarge': 2000, 'kafka.m5.4xlarge': 4000, 'kafka.m5.8xlarge': 8000,
-            'kafka.m5.12xlarge': 12000, 'kafka.m5.16xlarge': 16000, 'kafka.m5.24xlarge': 24000,
-            'kafka.m7g.large': 1000, 'kafka.m7g.xlarge': 1500, 'kafka.m7g.2xlarge': 2000,
-            'kafka.m7g.4xlarge': 4000, 'kafka.m7g.8xlarge': 8000, 'kafka.m7g.12xlarge': 12000,
-            'kafka.m7g.16xlarge': 16000, 'express.m7g.large': 1500, 'express.m7g.xlarge': 2000,
-            'express.m7g.2xlarge': 4000, 'express.m7g.4xlarge': 8000, 'express.m7g.8xlarge': 16000,
-            'express.m7g.12xlarge': 24000, 'express.m7g.16xlarge': 32000,
-        }
-        limit_per_broker = partition_limits.get(cluster_info.instance_type, 1000)
-        max_broker_partitions = int(cluster_max)
-        utilization = (max_broker_partitions / limit_per_broker) * 100
-        
-        if utilization > 100.0:
-            findings.append(Finding(
-                metric_name='PartitionCount',
-                severity=Severity.CRITICAL,
-                category=Category.PERFORMANCE,
-                title='Broker Partition Count Exceeded',
-                description=f'At least one broker has {max_broker_partitions} partitions, exceeding the {limit_per_broker} limit for {cluster_info.instance_type}.',
-                current_value=float(max_broker_partitions),
-                threshold_value=float(limit_per_broker),
-                evidence={'max_partitions': max_broker_partitions, 'limit': limit_per_broker, 'instance_type': cluster_info.instance_type}
-            ))
-        elif utilization >= 90.0:
-            findings.append(Finding(
-                metric_name='PartitionCount',
-                severity=Severity.WARNING,
-                category=Category.PERFORMANCE,
-                title='Broker Partition Count Near Limit',
-                description=f'At least one broker has {max_broker_partitions} partitions ({utilization:.1f}% of {limit_per_broker} limit for {cluster_info.instance_type}).',
-                current_value=float(max_broker_partitions),
-                threshold_value=float(limit_per_broker),
-                evidence={'max_partitions': max_broker_partitions, 'limit': limit_per_broker, 'instance_type': cluster_info.instance_type}
-            ))
-    
-    # Detect imbalance with different thresholds
-    max_deviation = max(abs(val - cluster_avg) / cluster_avg * 100 if cluster_avg > 0 else 0 for val in all_values)
-    
-    # Different thresholds for different metrics
-    if metric_name in ['MessagesInPerSec', 'PartitionCount', 'LeaderCount']:
-        imbalance_threshold = 10.0  # Stricter threshold
-    elif metric_name == 'ConnectionCount':
-        imbalance_threshold = 15.0  # Medium threshold
+        missing = 'CpuUser' if not cpu_user else 'CpuSystem'
+        findings.append(not_assessed('cpu_total', 'CpuTotal', Category.PERFORMANCE, 'CPU utilisation',
+                                     _missing_reason(metrics, missing), section='derived'))
+    b = _require_brokers(metrics, 'HeapMemoryAfterGC', 'heap_after_gc', Category.PERFORMANCE, 'Heap memory after GC', findings)
+    if b:
+        findings.extend(analyze_heap_memory(b))
+    bytes_in = metrics.broker_metrics('BytesInPerSec')
+    bytes_out = metrics.broker_metrics('BytesOutPerSec')
+    if bytes_in or bytes_out:
+        findings.extend(analyze_throughput(bytes_in, bytes_out, cluster_info))
+        if bytes_in:
+            findings.extend(analyze_balance('bytes_in_balance', 'BytesInPerSec',
+                                            {m_.broker_id: m_.statistics['avg'] for m_ in bytes_in}, 'Bytes/Second',
+                                            cluster_info, title_noun='inbound traffic'))
+        if bytes_out:
+            findings.extend(analyze_balance('bytes_out_balance', 'BytesOutPerSec',
+                                            {m_.broker_id: m_.statistics['avg'] for m_ in bytes_out}, 'Bytes/Second',
+                                            cluster_info, title_noun='outbound traffic'))
     else:
-        imbalance_threshold = 20.0  # Default threshold
-    
-    # For network metrics (BytesIn/Out), ignore imbalance if total volume is low (< 10MB/s per broker)
-    ignore_imbalance = False
-    if metric_name in ['BytesInPerSec', 'BytesOutPerSec']:
-        avg_mb_per_sec = cluster_avg / (1024 * 1024)
-        if avg_mb_per_sec < 10:
-            ignore_imbalance = True
-    
-    # For MessagesInPerSec, ignore if very low volume (< 100 msg/s per broker)
-    if metric_name == 'MessagesInPerSec' and cluster_avg < 100:
-        ignore_imbalance = True
-    
-    # For CPU metrics, ignore imbalance if all brokers have low usage (< 30%)
-    if metric_name in ['CpuUser', 'CpuSystem', 'CpuIdle'] and cluster_max < 30:
-        ignore_imbalance = True
-    
-    # Create summary finding
-    if max_deviation > imbalance_threshold and not ignore_imbalance:
-        # Special recommendation for PartitionCount imbalance
-        if metric_name == 'PartitionCount':
-            partition_limits = {
-                'kafka.t3.small': 300, 'kafka.m5.large': 1000, 'kafka.m5.xlarge': 1500,
-                'kafka.m5.2xlarge': 2000, 'kafka.m5.4xlarge': 4000, 'kafka.m5.8xlarge': 8000,
-                'kafka.m5.12xlarge': 12000, 'kafka.m5.16xlarge': 16000, 'kafka.m5.24xlarge': 24000,
-                'kafka.m7g.large': 1000, 'kafka.m7g.xlarge': 1500, 'kafka.m7g.2xlarge': 2000,
-                'kafka.m7g.4xlarge': 4000, 'kafka.m7g.8xlarge': 8000, 'kafka.m7g.12xlarge': 12000,
-                'kafka.m7g.16xlarge': 16000, 'express.m7g.large': 1500, 'express.m7g.xlarge': 2000,
-                'express.m7g.2xlarge': 4000, 'express.m7g.4xlarge': 8000, 'express.m7g.8xlarge': 16000,
-                'express.m7g.12xlarge': 24000, 'express.m7g.16xlarge': 32000,
-            }
-            limit_per_broker = partition_limits.get(cluster_info.instance_type, 1000)
-            total_capacity = limit_per_broker * len(broker_metrics)
-            total_partitions = sum(all_values)
-            capacity_utilization = (total_partitions / total_capacity) * 100
-            
-            # Check if there's available capacity for rebalancing
-            if capacity_utilization < 80:
-                tools = 'Use Cruise Control or kafka-reassign-partitions tool'
-                if cluster_info.cluster_type == 'EXPRESS':
-                    tools += ' or enable intelligent rebalancing'
-                
-                rebalance_action = (
-                    f'Rebalance partitions across all {len(broker_metrics)} brokers. '
-                    f'Cluster has {capacity_utilization:.1f}% capacity utilization ({int(total_partitions)}/{int(total_capacity)} partitions). '
-                    f'{tools}.'
-                )
-            else:
-                rebalance_action = (
-                    f'Cluster capacity at {capacity_utilization:.1f}% ({int(total_partitions)}/{int(total_capacity)} partitions). '
-                    f'Consider adding more brokers or upgrading instance type.'
-                )
-            
-            description = (
-                f'Partition distribution imbalance detected ({max_deviation:.1f}% deviation exceeds {imbalance_threshold}% threshold). '
-                f'Cluster avg: {cluster_avg:.0f}, min: {cluster_min:.0f}, max: {cluster_max:.0f}. {rebalance_action}'
-            )
-        # Special recommendation for MessagesInPerSec imbalance
-        elif metric_name == 'MessagesInPerSec':
-            rebalance_action = (
-                'Automatic rebalancing is enabled and will handle this.' if cluster_info.intelligent_rebalancing_enabled 
-                else 'Consider rebalancing partitions using Cruise Control or manual reassignment.'
-            )
-            description = (
-                f'Message distribution imbalance detected ({max_deviation:.1f}% deviation exceeds {imbalance_threshold}% threshold). '
-                f'Cluster avg: {cluster_avg:.0f} msg/s, min: {cluster_min:.0f}, max: {cluster_max:.0f}. {rebalance_action}'
-            )
-        else:
-            description = f'Significant imbalance detected ({max_deviation:.1f}% deviation). Cluster avg: {cluster_avg:.2f}, min: {cluster_min:.2f}, max: {cluster_max:.2f}'
-        
-        findings.append(Finding(
-            metric_name=metric_name,
-            severity=Severity.WARNING,
-            category=Category.PERFORMANCE,
-            title=f'{metric_name} - Broker Imbalance Detected',
-            description=description,
-            current_value=max_deviation,
-            threshold_value=imbalance_threshold,
-            evidence={'broker_count': len(broker_metrics), 'deviation': max_deviation}
-        ))
-    else:
-        findings.append(Finding(
-            metric_name=metric_name,
-            severity=Severity.HEALTHY,
-            category=Category.PERFORMANCE,
-            title=f'{metric_name} - Balanced Across Brokers',
-            description=f'Metric is balanced across {len(broker_metrics)} brokers. Avg: {cluster_avg:.2f}, min: {cluster_min:.2f}, max: {cluster_max:.2f}',
-            current_value=cluster_avg,
-            threshold_value=None,
-            evidence={'broker_count': len(broker_metrics)}
-        ))
-    
-    return findings
+        findings.append(not_assessed('throughput_in', 'BytesInPerSec', Category.PERFORMANCE, 'Network throughput',
+                                     _missing_reason(metrics, 'BytesInPerSec')))
+    msgs = metrics.broker_metrics('MessagesInPerSec')
+    if msgs:
+        findings.extend(analyze_balance('messages_balance', 'MessagesInPerSec',
+                                        {m_.broker_id: m_.statistics['avg'] for m_ in msgs}, 'Count/Second', cluster_info,
+                                        title_noun='message intake'))
+    parts = _require_brokers(metrics, 'PartitionCount', 'partition_capacity', Category.PERFORMANCE, 'Partitions per broker', findings)
+    if parts:
+        findings.extend(analyze_partition_capacity(parts, cluster_info, metrics.cluster_metric('GlobalPartitionCount')))
+        findings.extend(analyze_balance('partition_balance', 'PartitionCount',
+                                        {m_.broker_id: (m_.values[-1] if m_.values else m_.statistics['avg']) for m_ in parts},
+                                        'Count', cluster_info, title_noun='partition replicas'))
+    leaders = metrics.broker_metrics('LeaderCount')
+    if leaders:
+        findings.extend(analyze_balance('leader_balance', 'LeaderCount',
+                                        {m_.broker_id: (m_.values[-1] if m_.values else m_.statistics['avg']) for m_ in leaders},
+                                        'Count', cluster_info, title_noun='partition leaders'))
+    b = _require_brokers(metrics, 'ClientConnectionCount', 'client_connections', Category.PERFORMANCE, 'Client connections', findings)
+    if b:
+        findings.extend(analyze_client_connections(b, cluster_info))
+    conns = metrics.broker_metrics('ConnectionCount')
+    if conns:
+        findings.extend(analyze_balance('connection_balance', 'ConnectionCount',
+                                        {m_.broker_id: m_.statistics['avg'] for m_ in conns}, 'Count', cluster_info,
+                                        title_noun='connections'))
+    b = _require_brokers(metrics, 'ConnectionCreationRate', 'connection_creation_rate', Category.PERFORMANCE,
+                         'Connection creation rate', findings)
+    if b:
+        findings.extend(analyze_connection_creation_rate(b, cluster_info, metrics.broker_metrics('IAMTooManyConnections')))
+    findings.extend(analyze_enhanced_monitoring(cluster_info, metrics))
+
+    # Security
+    findings.extend(analyze_authentication_methods(cluster_info))
+    findings.extend(analyze_encryption(cluster_info))
+    findings.extend(analyze_logging_configuration(cluster_info, workload))
+
+    # Cost
+    findings.extend(analyze_instance_type(cluster_info))
+    findings.extend(analyze_right_sizing(cluster_info, findings))
+
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.category.value, f.title))
+    category_scores = {c.value: round(s, 1) for c, s in _calculate_category_scores(findings).items()}
+    health_score = _calculate_health_score(findings)
+    assessed = [f for f in findings if f.severity != Severity.NOT_ASSESSED]
+    result = AnalysisResult(
+        cluster_info=cluster_info, metrics=metrics, findings=findings, overall_health_score=health_score,
+        category_scores=category_scores, overall_status=overall_status(findings), checks_total=len(findings),
+        checks_assessed=len(assessed), workload=workload,
+        version_reference=next((f.evidence for f in findings if f.check_id == 'kafka_version'), {}),
+    )
+    logger.info(f"Analysis complete: {len(findings)} checks ({len(assessed)} assessed), status {result.overall_status}, "
+                f"score {health_score}")
+    return result

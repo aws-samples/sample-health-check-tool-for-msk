@@ -10,7 +10,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="msk-health-check-report",
-    version="0.1.0",
+    version="1.1.0",
     author="MSK Health Check Team",
     description="AWS MSK cluster health analysis and reporting tool",
     long_description=long_description,
