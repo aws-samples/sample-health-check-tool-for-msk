@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .cluster_info import ClusterInfo, parse_version
-from .metrics_collector import MetricData, MetricsCollection, align_series, summarize, metric_title
+from .metrics_collector import METRIC_CATALOG, MetricData, MetricsCollection, align_series, summarize, metric_title
 from . import reference as ref
 
 logger = logging.getLogger(__name__)
@@ -223,29 +223,41 @@ def overall_status(findings: List[Finding]) -> str:
 # --------------------------------------------------------------------------- reliability checks
 
 def analyze_active_controller_count(metric: MetricData) -> List[Finding]:
-    """Exactly one controller must be active. Uses the Minimum statistic so a brief drop is not
-    hidden inside a bucket."""
-    floor_val = metric.statistics.get('floor', metric.statistics['min'])
-    peak_val = metric.statistics.get('peak', metric.statistics['max'])
-    hours_without = sum(1 for v in metric.values if v < 1.0)
-    ev = {'statistics': metric.statistics, 'hours_without_controller': hours_without}
+    """Exactly one controller must be active. MSK publishes one sample per broker per minute (1 on
+    the controller, 0 elsewhere), so the series is the Sum per minute averaged over each bucket:
+    1.0 when a controller was present every minute, below 1 when it was missing for part of the bucket."""
+    # Normalise by the samples actually reported in each bucket, so publication jitter at bucket
+    # boundaries (observed: 58-60 sums over 178-181 samples per hour) does not look like a gap.
+    sums, counts = metric.series.get('Sum'), metric.series.get('SampleCount')
+    emitters = max(1, round(metric.emitters_per_minute))
+    if sums and counts and len(sums) == len(counts):
+        values = [(sm * emitters / c) if c else 0.0 for sm, c in zip(sums, counts)]
+    else:
+        values = list(metric.values)
+    floor_val = min(values) if values else 0.0
+    peak_val = max(values) if values else 0.0
+    hours_without = sum(1 for v in values if v < 0.95)
+    ev = {'statistics': metric.statistics, 'buckets_with_controller_gap': hours_without,
+          'controller_fraction_min': floor_val, 'controller_fraction_max': peak_val, 'brokers_reporting': emitters}
     common = dict(check_id='active_controller', metric_name='ActiveControllerCount', category=Category.RELIABILITY,
                   source='best_practices', chart='ActiveControllerCount', threshold=1.0, threshold_text='exactly 1')
-    if floor_val < 1.0:
+    if floor_val < 0.95:
         return [_finding(severity=Severity.CRITICAL, title='Cluster lost its active controller during the window',
-                         description=(f'ActiveControllerCount dropped below 1 in {hours_without} bucket(s). '
+                         description=(f'A controller was reported in only {floor_val * 100:.0f}% of the minutes of the worst bucket '
+                                      f'({hours_without} bucket(s) below 95%), meaning no broker held the controller role for part of that time. '
                                       'Without a controller, partition leadership changes and topic operations stall. '
                                       'Broker restarts or maintenance can explain short gaps; repeated gaps suggest '
                                       'controller instability.'),
-                         value=floor_val, evidence=ev, observed=f'minimum {floor_val:.0f}', **common)]
-    if round(peak_val) >= 2:
+                         value=floor_val, evidence=ev, observed=f'controller present {floor_val * 100:.0f}% of minutes', **common)]
+    if peak_val >= 1.5:
         return [_finding(severity=Severity.WARNING, title='More than one active controller reported',
                          description=(f'ActiveControllerCount reached {peak_val:.0f}. Two controllers can appear briefly '
                                       'during a controller move; a persistent value above 1 indicates a split view '
                                       'of the cluster that needs investigation.'),
-                         value=peak_val, evidence=ev, observed=f'maximum {peak_val:.0f}', **common)]
+                         value=peak_val, evidence=ev, observed=f'maximum {peak_val:.2f}', **common)]
     return [_finding(severity=Severity.HEALTHY, title='Exactly one active controller throughout the window',
-                     description='ActiveControllerCount stayed at 1 in every bucket.',
+                     description=('One broker reported itself as controller in every minute of the window (gaps shorter '
+                                  'than 5% of a bucket are below the resolution of this check).'),
                      value=1.0, evidence=ev, observed='1', **common)]
 
 
@@ -996,6 +1008,12 @@ def analyze_right_sizing(cluster_info: ClusterInfo, findings: List[Finding]) -> 
 
 # --------------------------------------------------------------------------- orchestration
 
+def _applicable(name: str, cluster_info: ClusterInfo) -> bool:
+    spec = METRIC_CATALOG.get(name)
+    kind = 'express' if cluster_info.is_express else 'standard'
+    return bool(spec) and kind in spec['kinds']
+
+
 def _require_brokers(metrics: MetricsCollection, name: str, check_id: str, category: Category, title: str,
                      findings: List[Finding], chart: Optional[str] = None) -> Optional[List[MetricData]]:
     brokers = metrics.broker_metrics(name)
@@ -1025,18 +1043,21 @@ def analyze_metrics(cluster_info: ClusterInfo, metrics: MetricsCollection, workl
     findings.extend(analyze_active_controller_count(m) if m else
                     [not_assessed('active_controller', 'ActiveControllerCount', Category.RELIABILITY, 'Active controller',
                                   _missing_reason(metrics, 'ActiveControllerCount'))])
-    m = metrics.cluster_metric('OfflinePartitionsCount')
-    findings.extend(analyze_offline_partitions(m) if m else
-                    [not_assessed('offline_partitions', 'OfflinePartitionsCount', Category.RELIABILITY, 'Offline partitions',
-                                  _missing_reason(metrics, 'OfflinePartitionsCount'))])
-    b = _require_brokers(metrics, 'UnderMinIsrPartitionCount', 'under_min_isr', Category.RELIABILITY,
-                         'Partitions below min ISR', findings)
-    if b:
-        findings.extend(analyze_under_min_isr(b))
-    b = _require_brokers(metrics, 'UnderReplicatedPartitions', 'under_replicated', Category.RELIABILITY,
-                         'Under-replicated partitions', findings)
-    if b:
-        findings.extend(analyze_under_replicated(b))
+    if _applicable('OfflinePartitionsCount', cluster_info):
+        m = metrics.cluster_metric('OfflinePartitionsCount')
+        findings.extend(analyze_offline_partitions(m) if m else
+                        [not_assessed('offline_partitions', 'OfflinePartitionsCount', Category.RELIABILITY, 'Offline partitions',
+                                      _missing_reason(metrics, 'OfflinePartitionsCount'))])
+    if _applicable('UnderMinIsrPartitionCount', cluster_info):
+        b = _require_brokers(metrics, 'UnderMinIsrPartitionCount', 'under_min_isr', Category.RELIABILITY,
+                             'Partitions below min ISR', findings)
+        if b:
+            findings.extend(analyze_under_min_isr(b))
+    if _applicable('UnderReplicatedPartitions', cluster_info):
+        b = _require_brokers(metrics, 'UnderReplicatedPartitions', 'under_replicated', Category.RELIABILITY,
+                             'Under-replicated partitions', findings)
+        if b:
+            findings.extend(analyze_under_replicated(b))
     if not express:
         b = _require_brokers(metrics, 'KafkaDataLogsDiskUsed', 'disk_usage', Category.RELIABILITY, 'Data log disk usage', findings)
         if b:
@@ -1058,9 +1079,10 @@ def analyze_metrics(cluster_info: ClusterInfo, metrics: MetricsCollection, workl
         missing = 'CpuUser' if not cpu_user else 'CpuSystem'
         findings.append(not_assessed('cpu_total', 'CpuTotal', Category.PERFORMANCE, 'CPU utilisation',
                                      _missing_reason(metrics, missing), section='derived'))
-    b = _require_brokers(metrics, 'HeapMemoryAfterGC', 'heap_after_gc', Category.PERFORMANCE, 'Heap memory after GC', findings)
-    if b:
-        findings.extend(analyze_heap_memory(b))
+    if _applicable('HeapMemoryAfterGC', cluster_info):
+        b = _require_brokers(metrics, 'HeapMemoryAfterGC', 'heap_after_gc', Category.PERFORMANCE, 'Heap memory after GC', findings)
+        if b:
+            findings.extend(analyze_heap_memory(b))
     bytes_in = metrics.broker_metrics('BytesInPerSec')
     bytes_out = metrics.broker_metrics('BytesOutPerSec')
     if bytes_in or bytes_out:

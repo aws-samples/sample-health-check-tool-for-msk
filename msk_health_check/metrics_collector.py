@@ -86,10 +86,11 @@ class MetricsCollection:
 # publish it. References: metrics-details.html (Standard) and metrics-details-express.html.
 METRIC_CATALOG: Dict[str, Dict[str, Any]] = {
     # Cluster level
-    'ActiveControllerCount': {'level': 'cluster', 'stat': 'Minimum', 'unit': 'Count', 'monitoring': 'DEFAULT',
+    # One sample per broker per minute (1 on the controller, 0 elsewhere): the cluster value is the Sum per minute
+    'ActiveControllerCount': {'level': 'cluster', 'stat': 'Sum', 'unit': 'Count', 'monitoring': 'DEFAULT',
                               'kinds': ('standard', 'express'), 'title': 'Active Controller Count'},
     'OfflinePartitionsCount': {'level': 'cluster', 'stat': 'Maximum', 'unit': 'Count', 'monitoring': 'DEFAULT',
-                               'kinds': ('standard', 'express'), 'title': 'Offline Partitions Count'},
+                               'kinds': ('standard',), 'title': 'Offline Partitions Count'},
     'GlobalPartitionCount': {'level': 'cluster', 'stat': 'Average', 'unit': 'Count', 'monitoring': 'DEFAULT',
                              'kinds': ('standard', 'express'), 'title': 'Global Partition Count'},
     'GlobalTopicCount': {'level': 'cluster', 'stat': 'Average', 'unit': 'Count', 'monitoring': 'DEFAULT',
@@ -106,7 +107,7 @@ METRIC_CATALOG: Dict[str, Dict[str, Any]] = {
     'MemoryFree': {'level': 'broker', 'stat': 'Average', 'unit': 'Bytes', 'monitoring': 'DEFAULT',
                    'kinds': ('standard', 'express'), 'title': 'Memory Free'},
     'HeapMemoryAfterGC': {'level': 'broker', 'stat': 'Average', 'unit': 'Percent', 'monitoring': 'DEFAULT',
-                          'kinds': ('standard', 'express'), 'title': 'Heap Memory After GC'},
+                          'kinds': ('standard',), 'title': 'Heap Memory After GC'},
     'KafkaDataLogsDiskUsed': {'level': 'broker', 'stat': 'Average', 'unit': 'Percent', 'monitoring': 'DEFAULT',
                               'kinds': ('standard',), 'title': 'Data Logs Disk Used'},
     # Per broker - counts
@@ -115,9 +116,11 @@ METRIC_CATALOG: Dict[str, Dict[str, Any]] = {
     'PartitionCount': {'level': 'broker', 'stat': 'Average', 'unit': 'Count', 'monitoring': 'DEFAULT',
                        'kinds': ('standard', 'express'), 'title': 'Partition Count (including replicas)'},
     'UnderMinIsrPartitionCount': {'level': 'broker', 'stat': 'Maximum', 'unit': 'Count', 'monitoring': 'DEFAULT',
-                                  'kinds': ('standard', 'express'), 'title': 'Under Min ISR Partitions'},
+                                  'kinds': ('standard',), 'title': 'Under Min ISR Partitions'},
     'UnderReplicatedPartitions': {'level': 'broker', 'stat': 'Maximum', 'unit': 'Count', 'monitoring': 'DEFAULT',
-                                  'kinds': ('standard', 'express'), 'title': 'Under-Replicated Partitions'},
+                                  'kinds': ('standard',), 'title': 'Under-Replicated Partitions'},
+    'StorageUsed': {'level': 'cluster', 'stat': 'Average', 'unit': 'Bytes', 'monitoring': 'DEFAULT',
+                    'kinds': ('express',), 'title': 'Storage Used (cluster, excluding replicas)'},
     # Per broker - traffic
     'BytesInPerSec': {'level': 'broker', 'stat': 'Average', 'unit': 'Bytes/Second', 'monitoring': 'DEFAULT',
                       'kinds': ('standard', 'express'), 'title': 'Bytes In Per Second'},
@@ -139,7 +142,7 @@ METRIC_CATALOG: Dict[str, Dict[str, Any]] = {
 }
 
 # Connection metrics are read as "Sum per minute" (broker total), everything else as its stat.
-SUM_PER_MINUTE_METRICS = {'ClientConnectionCount', 'ConnectionCount', 'ConnectionCreationRate'}
+SUM_PER_MINUTE_METRICS = {'ClientConnectionCount', 'ConnectionCount', 'ConnectionCreationRate', 'ActiveControllerCount'}
 
 
 def _catalog_view(kind: str) -> Dict[str, Dict[str, str]]:
@@ -502,7 +505,8 @@ def collect_metrics(
             optional_dim = spec.get('optional_dimension')
             dim_sets = dimension_sets_for(name)
             plain = ('Broker ID', 'Cluster Name')
-            use_breakdown = bool(optional_dim) and dim_sets and plain not in dim_sets
+            has_plain = (not dim_sets) or plain in dim_sets
+            use_breakdown = bool(optional_dim) and any(optional_dim in ds for ds in dim_sets)
             breakdown_values: List[str] = []
             if use_breakdown:
                 try:
@@ -512,16 +516,16 @@ def collect_metrics(
                     use_breakdown = False
 
             for broker_id in range(1, broker_count + 1):
+                if has_plain:
+                    futures.append((executor.submit(_query_metric, cloudwatch_client, name, cluster_name,
+                                                    str(broker_id), start_time, end_time, 3, period_seconds),
+                                    name, str(broker_id), None))
                 if use_breakdown and breakdown_values:
                     for value in breakdown_values:
                         extra = [{'Name': optional_dim, 'Value': value}]
                         futures.append((executor.submit(_query_metric, cloudwatch_client, name,
                                                         cluster_name, str(broker_id), start_time, end_time, 3,
                                                         period_seconds, extra), name, str(broker_id), value))
-                else:
-                    futures.append((executor.submit(_query_metric, cloudwatch_client, name, cluster_name,
-                                                    str(broker_id), start_time, end_time, 3, period_seconds),
-                                    name, str(broker_id), None))
 
         pending_breakdowns: Dict[Tuple[str, str], Dict[str, MetricData]] = {}
         for future, name, broker_id, breakdown_key in futures:
@@ -550,6 +554,12 @@ def collect_metrics(
                             f"coverage {data.coverage_pct:.0f}%")
 
         for (name, broker_id), parts in pending_breakdowns.items():
+            existing = next((m for m in metrics.get(name, []) if m.broker_id == broker_id), None)
+            if existing is not None:
+                # plain per-broker series already collected: attach the per-listener breakdown to it
+                existing.breakdown = {key: m.statistics['avg'] for key, m in parts.items()}
+                existing.breakdown_peak = {key: m.statistics['max'] for key, m in parts.items()}
+                continue
             merged = _merge_breakdown(parts, name, broker_id)
             metrics.setdefault(name, []).append(merged)
             logger.info(f"Collected {name} (broker {broker_id}) from {len(parts)} authentication listeners")
