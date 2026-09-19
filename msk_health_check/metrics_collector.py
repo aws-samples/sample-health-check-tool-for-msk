@@ -3,7 +3,7 @@
 Every metric is queried once per broker (or once per cluster) with all five CloudWatch
 statistics, so the analysis can pick the statistic that answers each question:
 
-* ``Average`` of the hourly buckets for utilisation-style gauges (CPU, disk, heap, bytes/s);
+* ``Average`` of the time buckets for utilisation-style gauges (CPU, disk, heap, bytes/s);
 * ``Maximum``/``Minimum`` for "did it ever happen" gauges (offline partitions, controller count);
 * ``Sum`` per minute for connection metrics, which MSK publishes as one datapoint per network
   processor per minute - averaging those samples would under-count the broker total.
@@ -193,6 +193,15 @@ def metrics_for_cluster(cluster_type: str, monitoring_level: Optional[str] = Non
 def _floor_to_period(ts: datetime, period_seconds: int) -> datetime:
     epoch = ts.timestamp()
     return datetime.fromtimestamp(epoch - (epoch % period_seconds), tz=timezone.utc)
+
+
+def choose_period(days_back: float) -> int:
+    """Bucket size for a window: 5 min up to 1 day, 15 min up to 5 days, 1 hour beyond (<= 1440 points)."""
+    if days_back <= 1:
+        return 300
+    if days_back <= 5:
+        return 900
+    return DEFAULT_PERIOD_SECONDS
 
 
 def compute_window(days_back: int, period_seconds: int = DEFAULT_PERIOD_SECONDS,
@@ -441,7 +450,7 @@ def collect_metrics(
     days_back: int = 30,
     monitoring_level: Optional[str] = None,
     auth_methods: Optional[List[str]] = None,
-    period_seconds: int = DEFAULT_PERIOD_SECONDS,
+    period_seconds: Optional[int] = None,
 ) -> MetricsCollection:
     """Collect all catalog metrics for a cluster.
 
@@ -455,6 +464,7 @@ def collect_metrics(
         auth_methods: authentication methods enabled on the cluster
         period_seconds: CloudWatch period per datapoint
     """
+    period_seconds = period_seconds or choose_period(days_back)
     start_time, end_time = compute_window(days_back, period_seconds)
     cluster_name = cluster_arn.split('/')[-2]
     to_query, not_published = metrics_for_cluster(cluster_type, monitoring_level, auth_methods)

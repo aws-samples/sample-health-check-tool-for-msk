@@ -354,7 +354,7 @@ def _stats_table(finding: Finding, metric_list: List[MetricData], s) -> Optional
                      _fmt_value(st.get('peak', st.get('max')), unit), _fmt_value(st.get('last'), unit), f'{m.coverage_pct:.0f}%'])
     basis = metric_list[0].effective_stat
     note = {'SumPerMinute': 'values are broker totals per minute (Sum of network-processor samples / minutes)',
-            'Maximum': 'values are the hourly Maximum statistic', 'Minimum': 'values are the hourly Minimum statistic'}.get(basis, 'values are hourly averages')
+            'Maximum': 'values are the Maximum statistic per bucket', 'Minimum': 'values are the Minimum statistic per bucket'}.get(basis, 'values are averages per bucket')
     t = _table(rows, [1.0 * inch, 0.9 * inch, 0.9 * inch, 1.0 * inch, 1.0 * inch, 0.9 * inch, 0.8 * inch])
     return KeepTogether([t, _p(f'Unit {unit or "count"}; {note}. Peak (1-min) is the highest 1-minute sample in the window.', s['caption'])])
 
@@ -488,11 +488,11 @@ def _methodology(content: ReportContent, s) -> List:
                   'is bounded by the worst finding: Critical when any critical finding exists, Needs Attention when any '
                   'warning exists, Healthy otherwise.', s['body']))
     els.append(Spacer(1, 6))
-    els.append(_p('Statistics. Utilisation gauges (CPU, heap, disk, bytes per second) use hourly averages; P95 is the 95th '
-                  'percentile of those hourly values and "peak" is the highest 1-minute sample. CPU User and CPU System are '
+    els.append(_p('Statistics. Utilisation gauges (CPU, heap, disk, bytes per second) use the average per bucket (bucket size shown '
+                  'in section 2); P95 is the 95th percentile of those values and "peak" is the highest 1-minute sample. CPU User and CPU System are '
                   'summed on matching timestamps before percentiles are computed. Event counters (offline partitions, '
-                  'partitions below min ISR, under-replicated partitions) use the hourly Maximum so short events are not '
-                  'averaged away; the controller count uses the hourly Minimum. Connection metrics are published as one '
+                  'partitions below min ISR, under-replicated partitions) use the Maximum per bucket so short events are not '
+                  'averaged away; the controller count uses the Minimum. Connection metrics are published as one '
                   'sample per network processor per minute, so broker totals are the Sum divided by the minutes in the bucket.',
                   s['body']))
     els.append(Spacer(1, 6))
@@ -518,7 +518,7 @@ def _methodology(content: ReportContent, s) -> List:
                   f'Rules version {ref.RULES_VERSION}; tool version {__version__}.' +
                   (f' Machine-readable manifest: {_esc(content.manifest_filename)}.' if content.manifest_filename else ''), s['body']))
     els.append(Spacer(1, 6))
-    els.append(_p('Limitations. Hourly buckets can hide sub-hour patterns other than the recorded peak; Standard broker '
+    els.append(_p('Limitations. Bucket averages can hide short patterns other than the recorded peak; Standard broker '
                   'network guidelines are not AWS quotas; topic-level and client-side behaviour is outside the scope of '
                   'CloudWatch cluster metrics.', s['small']))
     els.append(PageBreak())

@@ -224,7 +224,7 @@ def overall_status(findings: List[Finding]) -> str:
 
 def analyze_active_controller_count(metric: MetricData) -> List[Finding]:
     """Exactly one controller must be active. Uses the Minimum statistic so a brief drop is not
-    hidden inside an hourly bucket."""
+    hidden inside a bucket."""
     floor_val = metric.statistics.get('floor', metric.statistics['min'])
     peak_val = metric.statistics.get('peak', metric.statistics['max'])
     hours_without = sum(1 for v in metric.values if v < 1.0)
@@ -233,7 +233,7 @@ def analyze_active_controller_count(metric: MetricData) -> List[Finding]:
                   source='best_practices', chart='ActiveControllerCount', threshold=1.0, threshold_text='exactly 1')
     if floor_val < 1.0:
         return [_finding(severity=Severity.CRITICAL, title='Cluster lost its active controller during the window',
-                         description=(f'ActiveControllerCount dropped below 1 in {hours_without} hourly bucket(s). '
+                         description=(f'ActiveControllerCount dropped below 1 in {hours_without} bucket(s). '
                                       'Without a controller, partition leadership changes and topic operations stall. '
                                       'Broker restarts or maintenance can explain short gaps; repeated gaps suggest '
                                       'controller instability.'),
@@ -245,7 +245,7 @@ def analyze_active_controller_count(metric: MetricData) -> List[Finding]:
                                       'of the cluster that needs investigation.'),
                          value=peak_val, evidence=ev, observed=f'maximum {peak_val:.0f}', **common)]
     return [_finding(severity=Severity.HEALTHY, title='Exactly one active controller throughout the window',
-                     description='ActiveControllerCount stayed at 1 in every hourly bucket.',
+                     description='ActiveControllerCount stayed at 1 in every bucket.',
                      value=1.0, evidence=ev, observed='1', **common)]
 
 
@@ -262,7 +262,7 @@ def analyze_offline_partitions(metric: MetricData) -> List[Finding]:
         current = metric.values[-1] if metric.values else 0
         sev = Severity.CRITICAL
         when = f'last seen {last_ts.strftime("%Y-%m-%d %H:%M UTC")}' if last_ts else ''
-        desc = (f'Up to {peak_val:.0f} partition(s) were offline in {hours_affected} hourly bucket(s) ({when}). '
+        desc = (f'Up to {peak_val:.0f} partition(s) were offline in {hours_affected} bucket(s) ({when}). '
                 'Offline partitions have no leader, so producers and consumers of those partitions fail. '
                 'Typical causes are a broker outage with replication factor 1, or all replicas of a partition '
                 'unavailable at once. ')
@@ -271,7 +271,7 @@ def analyze_offline_partitions(metric: MetricData) -> List[Finding]:
         return [_finding(severity=sev, title='Offline partitions detected', description=desc, value=peak_val,
                          evidence=ev, observed=f'peak {peak_val:.0f}', **common)]
     return [_finding(severity=Severity.HEALTHY, title='No offline partitions',
-                     description='OfflinePartitionsCount was 0 in every hourly bucket.',
+                     description='OfflinePartitionsCount was 0 in every bucket.',
                      value=0.0, evidence=ev, observed='0', **common)]
 
 
@@ -288,14 +288,14 @@ def analyze_under_min_isr(brokers: List[MetricData]) -> List[Finding]:
         total = sum(current[b] for b in now_affected)
         return [_finding(severity=Severity.CRITICAL, title='Partitions currently below min.insync.replicas',
                          description=(f'{total:.0f} partition(s) on broker(s) {", ".join(now_affected)} are below the '
-                                      'configured minimum in-sync replicas in the latest hour. Producers with acks=all '
+                                      'configured minimum in-sync replicas in the latest bucket. Producers with acks=all '
                                       'receive NotEnoughReplicas errors and durability is reduced until replicas catch up.'),
                          value=total, evidence=ev, brokers=now_affected, observed=f'{total:.0f} now', **common)]
     if hist_affected:
         peak = max(historical.values())
         return [_finding(severity=Severity.WARNING, title='Partitions were below min.insync.replicas earlier in the window',
                          description=(f'Up to {peak:.0f} partition(s) fell below min ISR on broker(s) '
-                                      f'{", ".join(hist_affected)}; none are affected in the latest hour. Broker restarts '
+                                      f'{", ".join(hist_affected)}; none are affected in the latest bucket. Broker restarts '
                                       '(patching, size updates) explain short episodes; recurring episodes indicate a '
                                       'follower that cannot keep up.'),
                          value=peak, evidence=ev, brokers=hist_affected, observed=f'peak {peak:.0f}', confidence='medium',
@@ -329,8 +329,8 @@ def analyze_under_replicated(brokers: List[MetricData]) -> List[Finding]:
         sev, title = Severity.INFORMATIONAL, 'Brief under-replication episodes'
         conf = 'medium'
     desc = (f'Up to {peak:.0f} under-replicated partition(s) on broker(s) {", ".join(affected)}, present in '
-            f'{worst_hours} of {hours_total} hours ({share:.0f}%). ')
-    desc += ('Under-replication is still present in the latest hour. ' if current else '')
+            f'{worst_hours} of {hours_total} buckets ({share:.0f}%). ')
+    desc += ('Under-replication is still present in the latest bucket. ' if current else '')
     desc += ('Short episodes are expected during broker restarts and rolling updates; sustained under-replication '
              'means a follower cannot keep up (network, disk, or CPU pressure on the follower broker).')
     return [_finding(severity=sev, title=title, description=desc, value=peak, evidence=ev, brokers=affected,
@@ -456,13 +456,13 @@ def analyze_cpu_total(cpu_user: List[MetricData], cpu_system: List[MetricData]) 
     sustained = [b for b, v in p95.items() if v >= limit]
     episodic = [b for b, h in hours_over.items() if h > 0 and b not in sustained]
     worst = max(p95, key=p95.get)
-    ev = {'p95_per_broker': p95, 'avg_per_broker': avg, 'hours_at_or_above_60_per_broker': hours_over,
+    ev = {'p95_per_broker': p95, 'avg_per_broker': avg, 'buckets_at_or_above_60_per_broker': hours_over,
           'peak_per_broker': {b: d['stats']['peak'] for b, d in per_broker.items()}}
     common = dict(check_id='cpu_total', metric_name='CpuTotal', category=Category.PERFORMANCE, source='best_practices',
-                  chart='CpuTotal', section='derived', threshold=limit, threshold_text=f'< {limit:.0f}% (User + System)')
+                  chart='CpuTotal', section='derived', threshold=limit, threshold_text=f'< {limit:.0f}% (User + System, P95)')
     if sustained:
         return [_finding(severity=Severity.CRITICAL, title='Sustained CPU utilisation above 60%',
-                         description=(f'P95 of hourly CPU (User + System) is {p95[worst]:.1f}% on broker {worst}; brokers '
+                         description=(f'P95 of CPU (User + System) per bucket is {p95[worst]:.1f}% on broker {worst}; brokers '
                                       f'above the limit: {", ".join(sustained)}. Below 40% headroom, Kafka cannot absorb '
                                       'the extra load of a broker restart, patching or a leadership move without latency '
                                       'impact. AWS recommends moving to the next broker size, or adding brokers when '
@@ -470,14 +470,14 @@ def analyze_cpu_total(cpu_user: List[MetricData], cpu_system: List[MetricData]) 
                          value=p95[worst], evidence=ev, brokers=sustained, observed=f'P95 {p95[worst]:.1f}%', **common)]
     if episodic:
         hours = max(hours_over.values())
-        return [_finding(severity=Severity.WARNING, title='CPU utilisation exceeded 60% in some hours',
-                         description=(f'Hourly CPU (User + System) reached or exceeded 60% in up to {hours} hour(s) on '
+        return [_finding(severity=Severity.WARNING, title='CPU utilisation exceeded 60% in some periods',
+                         description=(f'CPU (User + System) reached or exceeded 60% in up to {hours} bucket(s) on '
                                       f'broker(s) {", ".join(episodic)}; P95 stays at {p95[worst]:.1f}%. Identify whether '
                                       'the peaks follow a batch schedule or a rebalance; if they grow, plan a size change.'),
-                         value=p95[worst], evidence=ev, brokers=episodic, observed=f'P95 {p95[worst]:.1f}%, {hours} h >= 60%',
+                         value=p95[worst], evidence=ev, brokers=episodic, observed=f'P95 {p95[worst]:.1f}%, {hours} buckets >= 60%',
                          confidence='medium', **common)]
     return [_finding(severity=Severity.HEALTHY, title='CPU utilisation within the recommended limit',
-                     description=(f'Highest P95 of hourly CPU (User + System) is {p95[worst]:.1f}% (broker {worst}); '
+                     description=(f'Highest P95 of CPU (User + System) is {p95[worst]:.1f}% (broker {worst}); '
                                   f'cluster average {np.mean(list(avg.values())):.1f}%.'),
                      value=p95[worst], evidence=ev, observed=f'P95 {p95[worst]:.1f}%', **common)]
 
@@ -490,7 +490,7 @@ def analyze_heap_memory(brokers: List[MetricData]) -> List[Finding]:
     worst = max(p95, key=p95.get)
     sustained = [b for b, v in p95.items() if v >= limit]
     episodic = [b for b, h in hours_over.items() if h > 0 and b not in sustained]
-    ev = {'p95_per_broker': p95, 'hours_at_or_above_60_per_broker': hours_over,
+    ev = {'p95_per_broker': p95, 'buckets_at_or_above_60_per_broker': hours_over,
           'peak_per_broker': {m.broker_id: m.statistics.get('peak', m.statistics['max']) for m in brokers}}
     common = dict(check_id='heap_after_gc', metric_name='HeapMemoryAfterGC', category=Category.PERFORMANCE,
                   source='best_practices', chart='HeapMemoryAfterGC', threshold=limit, threshold_text=f'< {limit:.0f}%')
@@ -503,8 +503,8 @@ def analyze_heap_memory(brokers: List[MetricData]) -> List[Finding]:
                                       'the number of partitions per broker reduces demand.'),
                          value=p95[worst], evidence=ev, brokers=sustained, observed=f'P95 {p95[worst]:.1f}%', **common)]
     if episodic:
-        return [_finding(severity=Severity.WARNING, title='Heap memory after GC exceeded 60% in some hours',
-                         description=(f'HeapMemoryAfterGC reached 60% in up to {max(hours_over.values())} hour(s) on '
+        return [_finding(severity=Severity.WARNING, title='Heap memory after GC exceeded 60% in some periods',
+                         description=(f'HeapMemoryAfterGC reached 60% in up to {max(hours_over.values())} bucket(s) on '
                                       f'broker(s) {", ".join(episodic)}; P95 is {p95[worst]:.1f}%.'),
                          value=p95[worst], evidence=ev, brokers=episodic, observed=f'P95 {p95[worst]:.1f}%',
                          confidence='medium', **common)]
@@ -576,7 +576,7 @@ def analyze_throughput(bytes_in: List[MetricData], bytes_out: List[MetricData], 
 
 def analyze_partition_capacity(brokers: List[MetricData], cluster_info: ClusterInfo,
                                global_partitions: Optional[MetricData]) -> List[Finding]:
-    """PartitionCount per broker (includes replicas) against the recommended and maximum values."""
+    """PartitionCount per broker (includes replicas, latest bucket) against the recommended and maximum values."""
     limits = ref.get_instance_limits(cluster_info.instance_type)
     current = {m.broker_id: (m.values[-1] if m.values else m.statistics['avg']) for m in brokers}
     worst = max(current, key=current.get)

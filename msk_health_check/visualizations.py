@@ -95,12 +95,12 @@ def _create_widget_definition(metric_name: str, cluster_info: ClusterInfo, metri
             metrics_array.append(_broker_metric('CpuSystem', cluster, b, 'Average', f'system {b}', False, f's{b}'))
             metrics_array.append([{'expression': f'u{b} + s{b}', 'label': f'Broker {b} (User + System)', 'id': f'c{b}'}])
         y_label = 'Percent'
-        title = 'CPU User + System per broker (hourly average)'
+        title = 'CPU User + System per broker (average per bucket)'
     elif metric_name in SUM_PER_MINUTE_METRICS:
         for b in brokers:
             metrics_array.append(_broker_metric(metric_name, cluster, b, 'Sum', f'sum {b}', False, f'm{b}'))
             metrics_array.append([{'expression': f'm{b} / {minutes}', 'label': f'Broker {b}', 'id': f't{b}'}])
-        title = f'{metric_title(metric_name)} per broker (total per minute, hourly mean)'
+        title = f'{metric_title(metric_name)} per broker (total per minute, mean per bucket)'
     else:
         spec = METRIC_CATALOG.get(metric_name, {'level': 'broker', 'stat': 'Average'})
         stat = spec['stat']
@@ -109,7 +109,7 @@ def _create_widget_definition(metric_name: str, cluster_info: ClusterInfo, metri
         else:
             for b in brokers:
                 metrics_array.append(_broker_metric(metric_name, cluster, b, stat, f'Broker {b}'))
-        stat_label = {'Average': 'hourly average', 'Maximum': 'hourly maximum', 'Minimum': 'hourly minimum'}.get(stat, stat)
+        stat_label = {'Average': 'average per bucket', 'Maximum': 'maximum per bucket', 'Minimum': 'minimum per bucket'}.get(stat, stat)
         title = f'{metric_title(metric_name)} ({stat_label})'
 
     widget: Dict[str, Any] = {
@@ -168,7 +168,7 @@ def _caption(metric_name: str) -> str:
     spec = METRIC_CATALOG.get(metric_name)
     if spec and spec['stat'] in ('Maximum', 'Minimum'):
         return f'Plotted with the {spec["stat"]} statistic so short events inside an hour remain visible.'
-    return 'Hourly averages; peaks inside an hour are summarised in the statistics table.'
+    return 'Averages per bucket; peaks inside a bucket are summarised in the statistics table.'
 
 
 # Backwards-compatible helpers used by older callers/tests

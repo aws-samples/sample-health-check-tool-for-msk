@@ -68,7 +68,7 @@ TEMPLATES: Dict[str, Dict[str, object]] = {
         rationale='Followers fall behind when the broker hosting them is saturated (CPU, disk throughput, network).',
         impact='Reduced redundancy; a second failure can take partitions offline or cause data loss.',
         confirm='Check CPU, KafkaDataLogsDiskUsed and BytesInPerSec on the affected brokers during the episodes.',
-        verify='UnderReplicatedPartitions is 0 for at least 95% of hourly buckets.',
+        verify='UnderReplicatedPartitions is 0 for at least 95% of the buckets in the window.',
         links=_links('best_practices')),
     'disk_usage': dict(
         action='Increase broker storage (or enable storage auto scaling), reduce retention (log.retention.hours / retention.bytes) or delete unused topics.',
@@ -110,7 +110,7 @@ TEMPLATES: Dict[str, Dict[str, object]] = {
         rationale='AWS recommends keeping CPU User + System under 60% so that maintenance and failover do not add latency.',
         impact='Produce and consume latency grows with CPU; a broker restart during peak overloads the remaining brokers.',
         confirm='Check whether the busiest brokers also lead more partitions (leader balance) or receive more traffic (traffic balance): if so, rebalancing may be enough.',
-        verify='P95 of hourly CPU (User + System) below 60% on every broker over the next window.',
+        verify='P95 of CPU (User + System) below 60% on every broker over the next window.',
         links=_links('best_practices', 'update_broker_type', 'update_broker_count')),
     'heap_after_gc': dict(
         action='Move to a broker size with more memory; if transactions are used, lower transactional.id.expiration.ms; reduce partitions per broker.',
