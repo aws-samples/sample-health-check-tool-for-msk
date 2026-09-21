@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Status label bounded by the worst finding; new HIGH severity for posture and resilience gaps (unauthenticated listener, plaintext traffic, 2 AZs in production) that lead to Needs Attention rather than Critical; informational findings no longer reduce the score
 - CloudWatch queries return all five statistics; Minimum for ActiveControllerCount, Maximum for partition-state metrics; connection metrics read as Sum per minute (broker total)
 - CPU User + System aligned by timestamp before percentiles; throughput, partitions and connections evaluated per broker
-- Broker size limits with provenance and confidence in `reference.py`; unknown sizes report not assessed instead of a default limit; disk threshold aligned with the documented 85% action level
+- Broker size limits with provenance and confidence in `reference.py`; unknown sizes report not assessed instead of a default limit; disk threshold aligned with the documented 85% action level, critical only while the latest value is above it (an earlier peak that came back is a warning); throughput bursts above the sustained limit reported as informational when P95 stays below
 - Recommendations consolidated per check with confirm / verify steps and documentation links; priority separated from severity
 - reportlab pin relaxed to `<5.0.0`; package version 1.1.0
 

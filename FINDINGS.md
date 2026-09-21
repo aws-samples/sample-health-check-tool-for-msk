@@ -50,8 +50,9 @@ summed; the IAM listener alone is compared with the IAM quota.
 | | | > 0 earlier in the window | WARNING | medium |
 | under_replicated | UnderReplicatedPartitions per broker (Maximum) | > 0 now, or in >= 5% of hours | WARNING | high |
 | | | brief episodes | INFORMATIONAL | medium |
-| disk_usage (Standard) | KafkaDataLogsDiskUsed per broker | peak >= 85% (AWS action threshold) | CRITICAL | high |
-| | | peak >= 75% (tool headroom) | WARNING | high |
+| disk_usage (Standard) | KafkaDataLogsDiskUsed per broker | latest value >= 85% (AWS action threshold) | CRITICAL | high |
+| | | peak >= 85% earlier in the window, now below (retention or a storage change brought it back) | WARNING | medium |
+| | | latest value >= 75% (tool headroom) | WARNING | high |
 | | | growth projection: days until 85% from a linear fit of the window | shown in the text | |
 | availability_zones (Standard) | client subnets (MSK requires one AZ per subnet; clusters span 2 or 3 AZs) | 2 AZs on a production cluster (AWS recommends 3) | HIGH | high |
 | | | 2 AZs, non-production | INFORMATIONAL | high |
@@ -74,6 +75,7 @@ summed; the IAM listener alone is compared with the IAM quota.
 | | | some hours >= 60% | WARNING | medium |
 | throughput_in / throughput_out | BytesInPerSec / BytesOutPerSec per broker | Express: 1-minute peak >= 90% of the throttle quota | CRITICAL | high |
 | | | P95 >= sustained limit (Express: published; Standard: tool guideline) | WARNING | high / low |
+| | | 1-minute peaks above the sustained limit while P95 stays below (bursts) | INFORMATIONAL | medium |
 | | | broker size not in catalog | NOT ASSESSED | |
 | partition_capacity | PartitionCount per broker (latest hour) | > maximum for the size | CRITICAL | high |
 | | | > recommended for the size | WARNING | high |
