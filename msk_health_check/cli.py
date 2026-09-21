@@ -152,6 +152,7 @@ def main(argv=None) -> int:
         print(f"  Status:          {analysis.overall_status} (score {analysis.overall_health_score}/100)")
         print(f"  Checks:          {analysis.checks_assessed}/{analysis.checks_total} assessed")
         print(f"  Findings:        {sum(1 for f in analysis.findings if f.severity.value == 'critical')} critical, "
+              f"{sum(1 for f in analysis.findings if f.severity.value == 'high')} high, "
               f"{sum(1 for f in analysis.findings if f.severity.value == 'warning')} warning")
         print(f"  Recommendations: {len(recommendations)}")
         return EXIT_OK

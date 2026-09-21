@@ -380,23 +380,34 @@ def analyze_disk_usage(brokers: List[MetricData], cluster_info: ClusterInfo) -> 
                   source='best_practices', chart='KafkaDataLogsDiskUsed', threshold=ref.DISK_ACTION_PCT,
                   threshold_text=f'action at {ref.DISK_ACTION_PCT:.0f}%, warning at {ref.DISK_WARNING_PCT:.0f}%')
     peak = peaks[worst_broker]
-    over = [b for b, v in peaks.items() if v >= ref.DISK_ACTION_PCT]
-    warn = [b for b, v in peaks.items() if ref.DISK_WARNING_PCT <= v < ref.DISK_ACTION_PCT]
-    if over:
-        return [_finding(severity=Severity.CRITICAL, title='Data log disk usage reached the action threshold',
-                         description=(f'Disk usage peaked at {peak:.1f}% on broker {worst_broker} (brokers at or above '
-                                      f'85%: {", ".join(over)}). A full data volume stops the broker and can take '
-                                      f'partitions offline.{proj}'),
-                         value=peak, evidence=ev, brokers=over, observed=f'peak {peak:.1f}%', **common)]
-    if warn:
+    current_worst = max(lasts, key=lasts.get)
+    current = lasts[current_worst]
+    over_now = [b for b, v in lasts.items() if v >= ref.DISK_ACTION_PCT]
+    warn_now = [b for b, v in lasts.items() if ref.DISK_WARNING_PCT <= v < ref.DISK_ACTION_PCT]
+    over_past = [b for b, v in peaks.items() if v >= ref.DISK_ACTION_PCT and b not in over_now]
+    if over_now:
+        return [_finding(severity=Severity.CRITICAL, title='Data log disk usage at or above the action threshold',
+                         description=(f'Disk usage is {current:.1f}% on broker {current_worst} in the latest bucket (brokers at or '
+                                      f'above 85%: {", ".join(over_now)}; peak in the window {peak:.1f}%). A full data volume stops '
+                                      f'the broker and can take partitions offline.{proj}'),
+                         value=current, evidence=ev, brokers=over_now, observed=f'now {current:.1f}%, peak {peak:.1f}%', **common)]
+    if over_past:
+        return [_finding(severity=Severity.WARNING, title='Data log disk usage reached the action threshold earlier in the window',
+                         description=(f'Disk usage peaked at {peak:.1f}% on broker {worst_broker} (brokers that reached 85%: '
+                                      f'{", ".join(over_past)}) and is now {current:.1f}% on the fullest broker. Retention or a '
+                                      f'storage change brought it back; confirm that the growth that caused the peak is under '
+                                      f'control.{proj}'),
+                         value=peak, evidence=ev, brokers=over_past, observed=f'peak {peak:.1f}%, now {current:.1f}%',
+                         confidence='medium', **common)]
+    if warn_now:
         return [_finding(severity=Severity.WARNING, title='Data log disk usage approaching the action threshold',
-                         description=(f'Disk usage peaked at {peak:.1f}% on broker {worst_broker}. AWS recommends acting '
-                                      f'at 85%.{proj}'),
-                         value=peak, evidence=ev, brokers=warn, observed=f'peak {peak:.1f}%', **common)]
+                         description=(f'Disk usage is {current:.1f}% on broker {current_worst} (peak {peak:.1f}%). AWS recommends '
+                                      f'acting at 85%.{proj}'),
+                         value=current, evidence=ev, brokers=warn_now, observed=f'now {current:.1f}%, peak {peak:.1f}%', **common)]
     return [_finding(severity=Severity.HEALTHY, title='Data log disk usage within limits',
-                     description=(f'Highest disk usage was {peak:.1f}% (broker {worst_broker}); the 85% action '
-                                  f'threshold was not approached.{proj}'),
-                     value=peak, evidence=ev, observed=f'peak {peak:.1f}%', **common)]
+                     description=(f'Disk usage is {current:.1f}% on the fullest broker ({current_worst}); highest value in the '
+                                  f'window {peak:.1f}%.{proj}'),
+                     value=current, evidence=ev, observed=f'now {current:.1f}%, peak {peak:.1f}%', **common)]
 
 
 def analyze_availability_zones(cluster_info: ClusterInfo, workload: str) -> List[Finding]:
@@ -592,6 +603,15 @@ def analyze_throughput(bytes_in: List[MetricData], bytes_out: List[MetricData], 
                                                   f'the {basis}, latency degrades before throttling starts.'),
                                      value=p95[worst], evidence=ev, brokers=over_sustained,
                                      observed=f'P95 {p95[worst]:.1f} MB/s', **common))
+        elif max(peak.values()) >= sustained:
+            bursts = [b for b, v in peak.items() if v >= sustained]
+            findings.append(_finding(severity=Severity.INFORMATIONAL, title=f'{label} throughput bursts above the sustained limit',
+                                     description=(f'P95 {label.lower()} throughput stays at {p95[worst]:.1f} MB/s, but 1-minute peaks '
+                                                  f'reached {max(peak.values()):.1f} MB/s on broker(s) {", ".join(bursts)}, above the '
+                                                  f'{basis} of {sustained:g} MB/s. Short bursts are absorbed; if they become sustained '
+                                                  'the check turns into a warning.'),
+                                     value=max(peak.values()), evidence=ev, brokers=bursts,
+                                     observed=f'peak {max(peak.values()):.1f} MB/s, P95 {p95[worst]:.1f} MB/s', **{**common, 'confidence': 'medium'}))
         else:
             findings.append(_finding(severity=Severity.HEALTHY, title=f'{label} throughput within the broker size limit',
                                      description=(f'Highest P95 {label.lower()} throughput is {p95[worst]:.1f} MB/s (broker '
