@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Initial release
-- Support for MSK Standard (Provisioned) and MSK Serverless (Express) clusters
+- Support for MSK Standard (Provisioned) and MSK Express (Provisioned) clusters
 - 18 metrics collection for both cluster types
 - Category-based health scoring system (Reliability 35%, Performance 30%, Security 20%, Cost 15%)
 - PDF report generation with visualizations and recommendations

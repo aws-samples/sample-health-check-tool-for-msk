@@ -17,9 +17,9 @@ Before opening an issue, please review the following documentation:
 
 If you encounter a bug or have a feature request, please:
 
-1. Check [existing issues](https://github.com/aws-samples/health-check-tool-for-msk/issues) to see if it's already reported
-2. Review [closed issues](https://github.com/aws-samples/health-check-tool-for-msk/issues?q=is%3Aissue+is%3Aclosed) for similar problems
-3. If not found, [open a new issue](https://github.com/aws-samples/health-check-tool-for-msk/issues/new) with:
+1. Check [existing issues](https://github.com/aws-samples/sample-health-check-tool-for-msk/issues) to see if it's already reported
+2. Review [closed issues](https://github.com/aws-samples/sample-health-check-tool-for-msk/issues?q=is%3Aissue+is%3Aclosed) for similar problems
+3. If not found, [open a new issue](https://github.com/aws-samples/sample-health-check-tool-for-msk/issues/new) with:
    - Clear description of the problem
    - Steps to reproduce
    - Expected vs actual behavior

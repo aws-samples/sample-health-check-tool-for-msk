@@ -15,7 +15,7 @@ setup(
     description="AWS MSK cluster health analysis and reporting tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/msk-health-check-report",
+    url="https://github.com/aws-samples/sample-health-check-tool-for-msk",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",

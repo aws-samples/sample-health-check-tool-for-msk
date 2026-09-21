@@ -289,8 +289,8 @@ This tool is provided as a sample for educational and demonstration purposes. Wh
 ## Support
 
 For issues, questions, or contributions:
-- GitHub Issues: [Report a bug](https://github.com/hermes-pimentel/msk-health-check/issues)
-- Documentation: [Wiki](https://github.com/hermes-pimentel/msk-health-check/wiki)
+- GitHub Issues: [Report a bug](https://github.com/aws-samples/sample-health-check-tool-for-msk/issues)
+- Documentation: [Wiki](https://github.com/aws-samples/sample-health-check-tool-for-msk/wiki)
 
 ## Changelog
 
