@@ -204,10 +204,10 @@ TEMPLATES: Dict[str, Dict[str, object]] = {
         verify='P95 ConnectionCreationRate below 70% of the quota and IAMTooManyConnections at 0.',
         links=_links('quotas', 'client_best_practices')),
     'enhanced_monitoring': dict(
-        action='Consider PER_BROKER enhanced monitoring for the connection-rate and throttling checks (paid CloudWatch metrics).',
-        rationale='PER_BROKER adds ConnectionCreationRate, IAMTooManyConnections and throttle metrics.',
-        impact='Connection-rate throttling cannot be detected from metrics.',
-        confirm='Check the list of checks limited by the current level in the evidence.',
+        action='Enable PER_BROKER enhanced monitoring (one level above DEFAULT) so that connection rate, IAM throttling, request latency and throttle metrics are published per broker.',
+        rationale='DEFAULT covers utilisation counters only; the checks that catch client misbehaviour (connection churn, throttling) need PER_BROKER metrics, which are paid CloudWatch metrics.',
+        impact='Connection-rate throttling, request latency and broker throttling cannot be detected from metrics; the corresponding checks stay not assessed.',
+        confirm='Review the list of checks not assessed because of the level (section 2 and the finding evidence) and the CloudWatch metric pricing for the Region.',
         verify='ConnectionCreationRate appears in CloudWatch for every broker.',
         links=_links('monitoring')),
     'authentication': dict(
@@ -263,12 +263,14 @@ TEMPLATES: Dict[str, Dict[str, object]] = {
 
 
 def _priority(finding: Finding) -> int:
-    base = {Severity.CRITICAL: 1, Severity.WARNING: 2, Severity.INFORMATIONAL: 4}.get(finding.severity, 5)
+    base = {Severity.CRITICAL: 1, Severity.HIGH: 1, Severity.WARNING: 2, Severity.INFORMATIONAL: 4}.get(finding.severity, 5)
     # Balance findings are a means to an end: lower priority unless a capacity check is also failing
     if finding.check_id.endswith('_balance') and base == 2:
         base = 3
-    if finding.check_id in ('graviton', 'right_sizing', 'enhanced_monitoring', 'public_access'):
+    if finding.check_id in ('graviton', 'right_sizing', 'public_access'):
         base = 5 if finding.severity == Severity.INFORMATIONAL else base
+    if finding.check_id == 'enhanced_monitoring' and finding.severity == Severity.INFORMATIONAL:
+        base = 2  # always recommended one level above DEFAULT
     if finding.confidence == 'low' and base < 3:
         base += 1
     return base
@@ -304,6 +306,6 @@ def generate_recommendations(analysis: AnalysisResult) -> List[Recommendation]:
         rec = create_recommendation_for_finding(finding)
         if rec:
             recommendations.append(rec)
-    severity_rank = {Severity.CRITICAL: 0, Severity.WARNING: 1, Severity.INFORMATIONAL: 2}
+    severity_rank = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.WARNING: 2, Severity.INFORMATIONAL: 3}
     recommendations.sort(key=lambda r: (r.priority, severity_rank.get(r.finding.severity, 3), r.finding.title))
     return recommendations

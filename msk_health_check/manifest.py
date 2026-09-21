@@ -161,7 +161,7 @@ def compare_runs(previous: Dict[str, Any], analysis: AnalysisResult) -> Dict[str
     """Diff a previous manifest against the current analysis."""
     prev_findings = {f['check_id']: f for f in previous.get('findings', []) if f.get('check_id')}
     curr = {f.check_id: f for f in analysis.findings if f.check_id}
-    actionable = {Severity.CRITICAL.value, Severity.WARNING.value}
+    actionable = {Severity.CRITICAL.value, Severity.HIGH.value, Severity.WARNING.value}
     new, resolved, changed, unchanged = [], [], [], []
     for cid, f in curr.items():
         p = prev_findings.get(cid)

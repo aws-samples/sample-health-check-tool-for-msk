@@ -35,8 +35,8 @@ A JSON manifest is written next to the PDF with the same content in machine-read
 ### Checks
 See [FINDINGS.md](FINDINGS.md) for the full catalog with statistics, thresholds, severities, confidence and sources. In short:
 
-- **Reliability** - active controller (Minimum statistic), offline partitions (Maximum), partitions below min ISR, under-replicated partitions, data-log disk usage with growth projection (Standard), availability zones, storage auto scaling read from Application Auto Scaling (Standard), Kafka version against the MSK version catalog (DEPRECATED status) and the documented recommended version, intelligent rebalancing status (Express).
-- **Performance** - CPU User + System per broker (series aligned by timestamp before summing), heap after GC, inbound/outbound throughput per broker against the published Express limits (sustained and throttle quota) or Standard guidelines, partitions per broker against recommended/maximum, client connections and connection creation rate against the IAM quotas (3000 per broker, 100/s; 4/s on kafka.t3.small), IAMTooManyConnections, per-broker balance of CPU, partitions, leaders, traffic, messages and connections above an activity floor, enhanced monitoring level.
+- **Reliability** - active controller (fraction of minutes with a controller), offline partitions (Maximum), partitions below min ISR, under-replicated partitions, data-log disk usage with growth projection (Standard), availability zones (2 vs 3 on Standard; Express always 3), storage auto scaling read from Application Auto Scaling (Standard), Kafka version against the MSK version catalog (DEPRECATED status) and the documented recommended version, intelligent rebalancing status (Express).
+- **Performance** - CPU User + System per broker (series aligned by timestamp before summing), heap after GC, inbound/outbound throughput per broker against the published Express limits (sustained and throttle quota) or Standard guidelines, partitions per broker against recommended/maximum, client connections and connection creation rate against the IAM quotas (3000 per broker, 100/s; 4/s on kafka.t3.small), IAMTooManyConnections, per-broker balance of CPU, partitions, leaders, traffic, messages and connections above an activity floor, enhanced monitoring level (always recommends at least PER_BROKER and lists the checks left out at DEFAULT).
 - **Security** - unauthenticated listener, client-broker and in-cluster encryption, encryption at rest, public access, broker log delivery.
 - **Cost** - Graviton counterpart available, right-sizing signal when every utilisation dimension is far below the size limits.
 
@@ -50,9 +50,9 @@ Every metric is queried per broker (or per cluster) with all five CloudWatch sta
 Connection metrics are published by MSK as one datapoint per network processor per minute, so the report reads them as `Sum` per minute (broker total) instead of `Average`.
 
 ### Health score
-- Each category starts at 100; every CRITICAL finding multiplies it by 0.60 and every WARNING by 0.85. Informational findings and checks not assessed do not change the score.
+- Each category starts at 100; every CRITICAL finding multiplies it by 0.60, every HIGH by 0.70 and every WARNING by 0.85. Informational findings and checks not assessed do not change the score.
 - Overall score = Reliability 35% + Performance 30% + Security 20% + Cost 15%.
-- Status label: **Critical** if any critical finding, **Needs Attention** if any warning, **Healthy** otherwise. The score is shown next to the label but never overrides it.
+- Status label: **Critical** if any critical finding (operational impact now or imminent), **Needs Attention** if any high or warning finding, **Healthy** otherwise. HIGH is used for posture and resilience gaps (unauthenticated listener, plaintext client traffic, 2 AZs on a production Standard cluster) that may be deliberate choices and do not label the cluster as unhealthy. The score is shown next to the label but never overrides it.
 
 ## Installation
 
@@ -258,7 +258,7 @@ mypy msk_health_check/
 
 ### Interpreting Results
 
-- **Status** is what to act on: Critical means at least one finding with data unavailability, a quota reached or a sustained breach of a published limit; Needs Attention means warnings only.
+- **Status** is what to act on: Critical means at least one finding with data unavailability, a quota reached or a sustained breach of a published limit; Needs Attention means high or warning findings only (posture gaps and approaching limits).
 - **Score** summarises how many findings exist and how heavy they are; two clusters with the same status can have different scores.
 - **Confidence** (high / medium / low) is printed with each finding; low-confidence findings rest on tool guidelines rather than published quotas.
 - **Not assessed** checks are listed in section 2 with the reason; enable the missing metric or permission to include them.
@@ -295,7 +295,7 @@ For issues, questions, or contributions:
 ## Changelog
 
 ### v1.1.0 (2026-09-19)
-- Status bounded by the worst finding; informational findings no longer reduce the score
+- Status bounded by the worst finding; HIGH severity for posture gaps that do not make the cluster unhealthy; informational findings no longer reduce the score
 - Explicit "not assessed" state with reason for every check that cannot run; coverage shown in the report
 - All CloudWatch statistics collected per query; Minimum/Maximum used for controller and partition-state metrics; connection metrics read as Sum per minute (broker total); CPU User + System aligned by timestamp
 - Per-broker evaluation of throughput, partitions, connections and connection creation rate against published limits; Express sustained vs throttle quota; unknown broker sizes report not assessed instead of a default limit

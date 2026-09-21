@@ -35,6 +35,7 @@ LIGHT = colors.HexColor('#f1f3f5')
 LINE = colors.HexColor('#dee2e6')
 SEVERITY_COLORS = {
     Severity.CRITICAL: colors.HexColor('#b02a37'),
+    Severity.HIGH: colors.HexColor('#c2410c'),
     Severity.WARNING: colors.HexColor('#b8860b'),
     Severity.INFORMATIONAL: colors.HexColor('#0b5ed7'),
     Severity.HEALTHY: colors.HexColor('#2e7d32'),
@@ -42,13 +43,14 @@ SEVERITY_COLORS = {
 }
 SEVERITY_FILL = {
     Severity.CRITICAL: colors.HexColor('#f8d7da'),
+    Severity.HIGH: colors.HexColor('#ffe5d0'),
     Severity.WARNING: colors.HexColor('#fff3cd'),
     Severity.INFORMATIONAL: colors.HexColor('#dbe7ff'),
     Severity.HEALTHY: colors.HexColor('#d4edda'),
     Severity.NOT_ASSESSED: colors.HexColor('#e9ecef'),
 }
 SEVERITY_LABEL = {
-    Severity.CRITICAL: 'CRITICAL', Severity.WARNING: 'WARNING', Severity.INFORMATIONAL: 'INFO',
+    Severity.CRITICAL: 'CRITICAL', Severity.HIGH: 'HIGH', Severity.WARNING: 'WARNING', Severity.INFORMATIONAL: 'INFO',
     Severity.HEALTHY: 'HEALTHY', Severity.NOT_ASSESSED: 'NOT ASSESSED',
 }
 CATEGORY_TITLES = {
@@ -227,23 +229,25 @@ def _executive_summary(content: ReportContent, s) -> List:
     status_color = SEVERITY_COLORS[{'Critical': Severity.CRITICAL, 'Needs Attention': Severity.WARNING}.get(an.overall_status, Severity.HEALTHY)]
     els.append(_p(f'Overall status <font color="{status_color.hexval()}"><b>{an.overall_status}</b></font>, health score '
                   f'<b>{an.overall_health_score:.0f}/100</b>. {an.checks_assessed} of {an.checks_total} checks were assessed: '
-                  f'{counts[Severity.CRITICAL]} critical, {counts[Severity.WARNING]} warning, {counts[Severity.INFORMATIONAL]} '
-                  f'informational, {counts[Severity.HEALTHY]} healthy; {counts[Severity.NOT_ASSESSED]} could not be evaluated '
-                  f'(see section 2). The status is bounded by the worst finding: a cluster with a critical finding is never '
-                  f'reported as Healthy, whatever the score.', s['body']))
+                  f'{counts[Severity.CRITICAL]} critical, {counts[Severity.HIGH]} high, {counts[Severity.WARNING]} warning, '
+                  f'{counts[Severity.INFORMATIONAL]} informational, {counts[Severity.HEALTHY]} healthy; {counts[Severity.NOT_ASSESSED]} '
+                  f'could not be evaluated (see section 2). The status is bounded by the worst finding: Critical means an operational '
+                  f'impact now or imminent; high findings are posture or resilience gaps that call for attention without making the '
+                  f'cluster unhealthy.', s['body']))
     els.append(Spacer(1, 6))
-    rows = [['Category', 'Weight', 'Score', 'Critical', 'Warning', 'Not assessed']]
+    rows = [['Category', 'Weight', 'Score', 'Critical', 'High', 'Warning', 'Not assessed']]
     for cat in CATEGORY_ORDER:
         fs = [f for f in an.findings if f.category == cat]
         rows.append([CATEGORY_TITLES[cat], f'{int(round(100 * CATEGORY_WEIGHTS[cat]))}%',
                      f'{an.category_scores.get(cat.value, 100):.0f}',
                      str(sum(1 for f in fs if f.severity == Severity.CRITICAL)),
+                     str(sum(1 for f in fs if f.severity == Severity.HIGH)),
                      str(sum(1 for f in fs if f.severity == Severity.WARNING)),
                      str(sum(1 for f in fs if f.severity == Severity.NOT_ASSESSED))])
-    els.append(_table(rows, [2.3 * inch, 0.8 * inch, 0.8 * inch, 0.9 * inch, 0.9 * inch, 1.1 * inch]))
+    els.append(_table(rows, [2.1 * inch, 0.7 * inch, 0.7 * inch, 0.8 * inch, 0.7 * inch, 0.8 * inch, 1.0 * inch]))
     els.append(Spacer(1, 10))
 
-    attention = [f for f in an.findings if f.severity in (Severity.CRITICAL, Severity.WARNING)]
+    attention = [f for f in an.findings if f.severity in (Severity.CRITICAL, Severity.HIGH, Severity.WARNING)]
     els.append(_p('Findings that need attention', s['h2']))
     if attention:
         rows = [['Severity', 'Finding', 'Observed', 'Threshold', 'Brokers']]
@@ -257,6 +261,14 @@ def _executive_summary(content: ReportContent, s) -> List:
         els.append(_p('No critical or warning findings in the analysed window.', s['body']))
     els.append(Spacer(1, 10))
 
+    mon = next((f for f in an.findings if f.check_id == 'enhanced_monitoring'), None)
+    if mon is not None and mon.severity == Severity.INFORMATIONAL:
+        left = mon.evidence.get('checks_not_assessed_because_of_level') or []
+        els.append(_p('Monitoring level', s['h2']))
+        els.append(_p(f'The cluster publishes DEFAULT-level metrics only. Not evaluated in this report because of that: '
+                      f'{_esc("; ".join(left)) if left else "nothing in this run"}. The recommendation is to enable PER_BROKER '
+                      f'(one level above DEFAULT); section 4 lists what it adds.', s['body']))
+        els.append(Spacer(1, 6))
     top = content.recommendations[:3]
     if top:
         els.append(_p('First actions', s['h2']))
@@ -411,7 +423,7 @@ def _findings_sections(content: ReportContent, s) -> List:
     charts = {c.metric_name: c for c in content.charts}
     recs = {r.finding.check_id: r for r in content.recommendations}
     els: List = [_p('4. Findings that need attention', s['h1'])]
-    attention = [f for f in an.findings if f.severity in (Severity.CRITICAL, Severity.WARNING, Severity.INFORMATIONAL)]
+    attention = [f for f in an.findings if f.severity in (Severity.CRITICAL, Severity.HIGH, Severity.WARNING, Severity.INFORMATIONAL)]
     if not attention:
         els.append(_p('No finding requires attention.', s['body']))
     for cat in CATEGORY_ORDER:
@@ -482,11 +494,14 @@ def _inventory(content: ReportContent, s) -> List:
 
 def _methodology(content: ReportContent, s) -> List:
     els: List = [_p('7. Methodology and scoring', s['h1'])]
-    els.append(_p('Each category starts at 100 and is multiplied by 0.60 for every critical finding and by 0.85 for every '
-                  'warning; informational findings and checks that were not assessed leave the score unchanged. The overall '
-                  'score is the weighted average (Reliability 35%, Performance 30%, Security 20%, Cost 15%). The status label '
-                  'is bounded by the worst finding: Critical when any critical finding exists, Needs Attention when any '
-                  'warning exists, Healthy otherwise.', s['body']))
+    els.append(_p('Each category starts at 100 and is multiplied by 0.60 for every critical finding, 0.70 for every high '
+                  'finding and 0.85 for every warning; informational findings and checks that were not assessed leave the '
+                  'score unchanged. The overall score is the weighted average (Reliability 35%, Performance 30%, Security 20%, '
+                  'Cost 15%). The status label is bounded by the worst finding: Critical when any critical finding exists '
+                  '(operational impact now or imminent), Needs Attention when any high or warning finding exists, Healthy '
+                  'otherwise. High is used for posture and resilience gaps - an unauthenticated listener, plaintext client '
+                  'traffic, a single availability zone - which may be deliberate choices and do not by themselves make the '
+                  'cluster unhealthy.', s['body']))
     els.append(Spacer(1, 6))
     els.append(_p('Statistics. Utilisation gauges (CPU, heap, disk, bytes per second) use the average per bucket (bucket size shown '
                   'in section 2); P95 is the 95th percentile of those values and "peak" is the highest 1-minute sample. CPU User and CPU System are '

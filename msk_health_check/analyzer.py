@@ -24,8 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 class Severity(Enum):
-    """Severity levels for findings."""
+    """Severity levels for findings.
+
+    CRITICAL - operational impact now or imminent (unavailable data, quota reached, published limit exceeded)
+    HIGH     - serious posture or resilience gap that does not by itself make the cluster unhealthy
+               (unauthenticated listener, plaintext client traffic, single availability zone)
+    WARNING  - approaching a limit, resilience recommendation, episodic breach
+    """
     CRITICAL = "critical"
+    HIGH = "high"
     WARNING = "warning"
     INFORMATIONAL = "informational"
     HEALTHY = "healthy"
@@ -47,8 +54,8 @@ CATEGORY_WEIGHTS = {
     Category.COST: 0.15,
 }
 
-SEVERITY_ORDER = {Severity.CRITICAL: 0, Severity.WARNING: 1, Severity.INFORMATIONAL: 2,
-                  Severity.HEALTHY: 3, Severity.NOT_ASSESSED: 4}
+SEVERITY_ORDER = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.WARNING: 2, Severity.INFORMATIONAL: 3,
+                  Severity.HEALTHY: 4, Severity.NOT_ASSESSED: 5}
 
 
 @dataclass
@@ -183,12 +190,14 @@ def _linear_growth_per_day(metric: MetricData) -> Optional[float]:
 # --------------------------------------------------------------------------- scoring
 
 def _calculate_category_score(findings: List[Finding]) -> float:
-    """100 reduced multiplicatively: x0.60 per CRITICAL, x0.85 per WARNING. Informational findings
-    and checks that were not assessed do not change the score."""
+    """100 reduced multiplicatively: x0.60 per CRITICAL, x0.70 per HIGH, x0.85 per WARNING. Informational
+    findings and checks that were not assessed do not change the score."""
     score = 100.0
     for f in findings:
         if f.severity == Severity.CRITICAL:
             score *= 0.60
+        elif f.severity == Severity.HIGH:
+            score *= 0.70
         elif f.severity == Severity.WARNING:
             score *= 0.85
     return max(0.0, score)
@@ -211,11 +220,12 @@ def _calculate_health_score(findings: List[Finding]) -> float:
 
 
 def overall_status(findings: List[Finding]) -> str:
-    """Status label bounded by the worst severity: a critical finding can never read as Healthy."""
+    """Status label bounded by the worst severity: a critical finding can never read as Healthy.
+    HIGH findings (posture gaps) call for attention but do not label the cluster as Critical."""
     severities = {f.severity for f in findings}
     if Severity.CRITICAL in severities:
         return 'Critical'
-    if Severity.WARNING in severities:
+    if Severity.HIGH in severities or Severity.WARNING in severities:
         return 'Needs Attention'
     return 'Healthy'
 
@@ -390,26 +400,29 @@ def analyze_disk_usage(brokers: List[MetricData], cluster_info: ClusterInfo) -> 
 
 
 def analyze_availability_zones(cluster_info: ClusterInfo, workload: str) -> List[Finding]:
+    """MSK Standard clusters span 2 or 3 AZs (a subnet per AZ); AWS recommends 3 for production.
+    Express brokers are always deployed across 3 AZs, so the check only reports the fact."""
     az = cluster_info.availability_zones
     common = dict(check_id='availability_zones', metric_name='AvailabilityZones', category=Category.RELIABILITY,
-                  source='best_practices', section='configuration', threshold=3.0, threshold_text='3 AZs')
-    if az <= 0:
+                  source='best_practices', section='configuration', threshold=3.0, threshold_text='3 AZs for production')
+    if cluster_info.is_express:
+        return [_finding(severity=Severity.HEALTHY, title='Three availability zones (Express)',
+                         description='Express brokers are always distributed across three AZs with replication factor 3.',
+                         value=3.0, evidence={'az_count': az or 3, 'enforced_by': 'Express brokers'}, observed='3 AZs', **common)]
+    if az < 2:
         return [not_assessed('availability_zones', 'AvailabilityZones', Category.RELIABILITY, 'Availability zones',
-                             'The cluster description did not include client subnets.', section='configuration')]
+                             'The cluster description did not include the expected client subnets.', section='configuration')]
     ev = {'az_count': az, 'client_subnets': cluster_info.client_subnets}
-    if az == 1:
-        return [_finding(severity=Severity.CRITICAL, title='Single availability zone',
-                         description='All brokers are in one AZ; an AZ event takes the whole cluster offline.',
-                         value=float(az), evidence=ev, observed='1 AZ', **common)]
     if az == 2:
-        sev = Severity.WARNING if workload == 'production' else Severity.INFORMATIONAL
+        sev = Severity.HIGH if workload == 'production' else Severity.INFORMATIONAL
         return [_finding(severity=sev, title='Two availability zones',
-                         description=('Brokers span 2 AZs. AWS recommends 3 AZs for production so that the loss of '
-                                      'one AZ leaves a majority of replicas available; with 2 AZs and replication '
-                                      'factor 3, an AZ failure can leave partitions with a single in-sync replica.'),
+                         description=('Brokers span 2 AZs. The AWS best practice for production clusters is a three-AZ '
+                                      'deployment, so that the loss of one AZ leaves a majority of replicas in sync; with 2 AZs '
+                                      'and replication factor 3, an AZ failure can leave partitions with a single in-sync replica '
+                                      'and block producers that use acks=all with min.insync.replicas=2.'),
                          value=float(az), evidence=ev, observed='2 AZs', **common)]
     return [_finding(severity=Severity.HEALTHY, title='Three availability zones',
-                     description=f'Brokers span {az} AZs, matching the AWS recommendation.',
+                     description=f'Brokers span {az} AZs, matching the AWS recommendation for production clusters.',
                      value=float(az), evidence=ev, observed=f'{az} AZs', **common)]
 
 
@@ -845,11 +858,12 @@ def analyze_authentication_methods(cluster_info: ClusterInfo) -> List[Finding]:
                   source='authentication', section='configuration')
     if 'unauthenticated' in methods:
         others = [m for m in methods if m != 'unauthenticated']
-        return [_finding(severity=Severity.CRITICAL, title='Unauthenticated client access is enabled',
+        return [_finding(severity=Severity.HIGH, title='Unauthenticated client access is enabled',
                          description=('The cluster accepts unauthenticated connections' +
                                       (f' alongside {", ".join(others)}' if others else '') +
-                                      '. Any client with network access to the brokers can produce and consume. '
-                                      'Migrate clients to IAM, SASL/SCRAM or mTLS and disable the unauthenticated listener.'),
+                                      '. Any client with network access to the brokers can produce and consume. This may be '
+                                      'a deliberate choice for an isolated network; if not, migrate clients to IAM, SASL/SCRAM '
+                                      'or mTLS and disable the unauthenticated listener.'),
                          value=None, evidence=ev, observed='unauthenticated enabled', threshold_text='authenticated listeners only', **common)]
     if not methods:
         return [not_assessed('authentication', 'Authentication', Category.SECURITY, 'Client authentication',
@@ -866,7 +880,7 @@ def analyze_encryption(cluster_info: ClusterInfo) -> List[Finding]:
     common = dict(check_id='encryption_in_transit', metric_name='EncryptionInTransit', category=Category.SECURITY,
                   source='encryption', section='configuration', threshold_text='TLS')
     if mode == 'PLAINTEXT':
-        findings.append(_finding(severity=Severity.CRITICAL, title='Client traffic is not encrypted',
+        findings.append(_finding(severity=Severity.HIGH, title='Client traffic is not encrypted',
                                  description='Client-broker encryption is PLAINTEXT; data and credentials cross the network unencrypted.',
                                  value=None, evidence=ev, observed='PLAINTEXT', **common))
     elif mode == 'TLS_PLAINTEXT':
@@ -914,22 +928,47 @@ def analyze_logging_configuration(cluster_info: ClusterInfo, workload: str) -> L
                      value=0.0, evidence=ev, observed='disabled', **common)]
 
 
+PER_BROKER_ADDS = {
+    'ConnectionCreationRate': 'connection creation rate per broker against the IAM quota',
+    'IAMTooManyConnections': 'IAM connection throttling (attempts refused above the quota)',
+    'ConnectionCloseRate': 'connection close rate (churn) per broker',
+    'ProduceThrottleTime / FetchThrottleTime': 'produce and fetch throttling applied by the broker',
+    'RequestHandlerAvgIdlePercent / NetworkProcessorAvgIdlePercent': 'thread pool saturation',
+    'Produce*/Fetch*TimeMsMean': 'request latency breakdown (queue, local, response send)',
+    'ReplicationBytesIn/OutPerSec': 'replication traffic between brokers',
+    'BwIn/BwOutAllowanceExceeded, PpsAllowanceExceeded': 'network allowance shaping on the broker instance',
+    'VolumeReadBytes/VolumeWriteBytes/VolumeQueueLength': 'EBS volume activity (Standard brokers)',
+}
+
+
 def analyze_enhanced_monitoring(cluster_info: ClusterInfo, metrics: MetricsCollection) -> List[Finding]:
+    """Enhanced monitoring level. DEFAULT is free but leaves the connection-rate and throttling checks
+    without data; the report always recommends at least PER_BROKER and lists what was left out."""
     level = cluster_info.enhanced_monitoring_level
-    skipped = sorted(n for n, r in metrics.not_published.items() if 'enhanced monitoring' in r)
-    ev = {'level': level, 'checks_limited_by_level': skipped}
+    skipped_metrics = sorted(n for n, r in metrics.not_published.items() if 'enhanced monitoring' in r)
+    skipped_checks = [PER_BROKER_ADDS[m] for m in skipped_metrics if m in PER_BROKER_ADDS]
+    ev = {'level': level, 'metrics_not_available_at_this_level': skipped_metrics,
+          'checks_not_assessed_because_of_level': skipped_checks,
+          'per_broker_adds': PER_BROKER_ADDS}
     common = dict(check_id='enhanced_monitoring', metric_name='EnhancedMonitoring', category=Category.PERFORMANCE,
                   source='monitoring', section='configuration', threshold_text='PER_BROKER or higher')
     if ref.monitoring_level_rank(level) >= 1:
+        extra = ''
+        if ref.monitoring_level_rank(level) >= 2:
+            extra = (' Topic-level metrics (PER_TOPIC_PER_BROKER) are published as well; this report reads broker-level '
+                     'metrics only, so they do not change its checks.')
         return [_finding(severity=Severity.HEALTHY, title=f'Enhanced monitoring at {level}',
-                         description='Per-broker connection rate and throttling metrics are available to this analysis.',
+                         description=('Per-broker connection rate, IAM throttling and request-latency metrics are available '
+                                      'to this analysis.' + extra),
                          value=1.0, evidence=ev, observed=level, **common)]
-    return [_finding(severity=Severity.INFORMATIONAL, title='Enhanced monitoring at DEFAULT level',
-                     description=('DEFAULT-level metrics (free) already include per-broker CPU, memory, disk, partitions and '
-                                  'connections. PER_BROKER adds ConnectionCreationRate, IAMTooManyConnections and throttle '
-                                  'metrics; the following checks were limited by the current level: ' +
-                                  (', '.join(skipped) if skipped else 'none') + '.'),
-                     value=0.0, evidence=ev, observed=level, **common)]
+    left_out = '; '.join(skipped_checks) if skipped_checks else 'none in this run'
+    adds = '; '.join(f'{k} ({v})' for k, v in list(PER_BROKER_ADDS.items())[:5])
+    return [_finding(severity=Severity.INFORMATIONAL, title='Enhanced monitoring at DEFAULT level - PER_BROKER recommended',
+                     description=('DEFAULT-level metrics (free) cover per-broker CPU, memory, disk, partitions and connection '
+                                  'counts, which is what this report could evaluate. Checks not assessed because of the level: '
+                                  f'{left_out}. Enabling PER_BROKER (paid CloudWatch metrics) adds, among others: {adds}. '
+                                  'The recommendation is to run at least one level above DEFAULT on any cluster that matters.'),
+                     value=0.0, evidence=ev, observed=level, confidence='high', **common)]
 
 
 def analyze_intelligent_rebalancing(cluster_info: ClusterInfo) -> List[Finding]:

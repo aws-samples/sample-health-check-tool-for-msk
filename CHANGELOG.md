@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PDF: real table of contents and bookmarks, action plan with priority, severity and confidence, observed value vs threshold and source per finding, threshold lines on charts, per-broker statistics tables, methodology section
 
 ### Changed
-- Status label bounded by the worst finding; informational findings no longer reduce the score
+- Status label bounded by the worst finding; new HIGH severity for posture and resilience gaps (unauthenticated listener, plaintext traffic, 2 AZs in production) that lead to Needs Attention rather than Critical; informational findings no longer reduce the score
 - CloudWatch queries return all five statistics; Minimum for ActiveControllerCount, Maximum for partition-state metrics; connection metrics read as Sum per minute (broker total)
 - CPU User + System aligned by timestamp before percentiles; throughput, partitions and connections evaluated per broker
 - Broker size limits with provenance and confidence in `reference.py`; unknown sizes report not assessed instead of a default limit; disk threshold aligned with the documented 85% action level
