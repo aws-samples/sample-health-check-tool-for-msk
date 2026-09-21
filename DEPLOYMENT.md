@@ -19,8 +19,8 @@ This guide covers different deployment options for the MSK Health Check Report t
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/yourusername/msk-health-check.git
-cd msk-health-check
+git clone https://github.com/aws-samples/sample-health-check-tool-for-msk.git
+cd sample-health-check-tool-for-msk
 ```
 
 2. **Create virtual environment (recommended)**
@@ -201,7 +201,10 @@ aws lambda create-function \
         "kafka:DescribeClusterV2",
         "kafka:ListKafkaVersions",
         "cloudwatch:GetMetricStatistics",
-        "cloudwatch:GetMetricWidgetImage"
+        "cloudwatch:GetMetricWidgetImage",
+        "cloudwatch:ListMetrics",
+        "application-autoscaling:DescribeScalableTargets",
+        "application-autoscaling:DescribeScalingPolicies"
       ],
       "Resource": "*"
     },

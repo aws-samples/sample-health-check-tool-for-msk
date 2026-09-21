@@ -28,7 +28,7 @@ def test_property_time_period_documentation(days_back):
 
 # Property 4: Complete metric retrieval attempt
 def test_property_complete_metric_retrieval_attempt():
-    """Property: System should attempt to retrieve all 16 defined metrics."""
+    """Property: System should attempt to retrieve every metric defined for Standard brokers."""
     mock_client = MockCloudWatchClient(success=True)
     cluster_arn = 'arn:aws:kafka:us-east-1:123456789012:cluster/test/uuid'
     
@@ -36,8 +36,8 @@ def test_property_complete_metric_retrieval_attempt():
     
     # Should attempt all metrics
     total_attempted = len(result.metrics) + len(result.missing_metrics)
-    assert total_attempted == len(METRIC_DEFINITIONS)
-    assert total_attempted == 16
+    assert total_attempted == len(STANDARD_METRICS)
+    assert total_attempted == len(STANDARD_METRICS)
 
 
 # Property 5: Exponential backoff retry
@@ -52,8 +52,7 @@ def test_property_exponential_backoff_retry():
         end_time = datetime.utcnow()
         
         query_metric_with_retry(
-            mock_client, 'CpuUser',
-            'arn:aws:kafka:us-east-1:123456789012:cluster/test/uuid',
+            mock_client, 'CpuUser', 'test', '1',
             start_time, end_time, max_retries=3
         )
         
@@ -89,5 +88,5 @@ def test_property_graceful_degradation():
             assert metric in result.missing_metrics
         
         # Should have collected remaining metrics
-        expected_successful = len(METRIC_DEFINITIONS) - len(failing_metrics)
+        expected_successful = len(STANDARD_METRICS) - len(failing_metrics)
         assert len(result.metrics) == expected_successful

@@ -69,9 +69,9 @@ class TestHealthScoreCalculation:
         # Reliability: 100 * 0.6 = 60, weighted: 60 * 0.35 = 21
         # Performance: 100 * 0.85 = 85, weighted: 85 * 0.30 = 25.5
         # Security: 100 * 1.0 = 100, weighted: 100 * 0.20 = 20
-        # Cost: 100 * 0.95 = 95, weighted: 95 * 0.15 = 14.25
-        # Total: 21 + 25.5 + 20 + 14.25 = 80.75
-        assert score == 80.8  # Rounded
+        # Cost: informational findings do not deduct, 100 * 0.15 = 15
+        # Total: 21 + 25.5 + 20 + 15 = 81.5
+        assert score == 81.5
     
     def test_score_minimum_zero(self):
         """Test score doesn't go below zero with many critical findings."""
